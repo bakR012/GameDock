@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.6.0.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -836,34 +836,47 @@ class GameDock : Window {
         ColorSlider(body,T("التشبّع","Saturation"),"%",100,c.Saturation,delegate(int n) { c.Saturation=n; changed(); });
         ColorSlider(body,T("السطوع","Brightness"),"%",100,c.Brightness,delegate(int n) { c.Brightness=n; changed(); });
     }
+    void ApplyTopmost(bool enabled) {
+        Topmost=enabled;
+        foreach(var dock in mirrors) dock.Topmost=enabled;
+        if(settingsWindow!=null) settingsWindow.Topmost=enabled;
+    }
+    void AddSwitch(StackPanel body,string label,bool enabled,Action<bool> changed) {
+        var switchRow=new DockPanel {Margin=new Thickness(2,10,2,3)};
+        var knob=new Border {Width=14,Height=14,CornerRadius=new CornerRadius(7),Margin=new Thickness(3),Background=Brushes.White};
+        var track=new Border {Width=36,Height=20,CornerRadius=new CornerRadius(10),Child=knob};
+        var toggle=new ToggleButton {Content=track,IsChecked=enabled,VerticalAlignment=VerticalAlignment.Center,
+            Padding=new Thickness(0),BorderThickness=new Thickness(0),Cursor=Cursors.Hand,ToolTip=label};
+        var presenter=new FrameworkElementFactory(typeof(ContentPresenter));
+        toggle.Template=new ControlTemplate(typeof(ToggleButton)){VisualTree=presenter};
+        System.Windows.Automation.AutomationProperties.SetName(toggle,label);
+        Action paint=delegate {
+            knob.HorizontalAlignment=enabled ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+            track.Background=enabled ? Color("#217B66") : Color("#737780");
+        };
+        paint();
+        toggle.Click+=delegate {
+            enabled=toggle.IsChecked==true;
+            changed(enabled); paint();
+        };
+        DockPanel.SetDock(toggle,Dock.Right); switchRow.Children.Add(toggle);
+        switchRow.Children.Add(new TextBlock {Text=label,VerticalAlignment=VerticalAlignment.Center});
+        body.Children.Add(switchRow);
+    }
     void DrawSettings() {
         var w = settingsWindow;
         w.Title = T("إعدادات GameDock", "GameDock settings");
         w.FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft;
         var body = new StackPanel { Margin = new Thickness(16,4,16,14) };
         AddDisplaySetting(body);
-        var switchRow=new DockPanel {Margin=new Thickness(2,10,2,3)};
-        var label=T("إظهار الشريط في Alt+Tab","Show dock in Alt+Tab");
-        var knob=new Border {Width=14,Height=14,CornerRadius=new CornerRadius(7),Margin=new Thickness(3),Background=Brushes.White};
-        var track=new Border {Width=36,Height=20,CornerRadius=new CornerRadius(10),Child=knob};
-        var toggle=new ToggleButton {Content=track,IsChecked=showInSwitcher,VerticalAlignment=VerticalAlignment.Center,
-            Padding=new Thickness(0),BorderThickness=new Thickness(0),Cursor=Cursors.Hand,ToolTip=label};
-        var presenter=new FrameworkElementFactory(typeof(ContentPresenter));
-        toggle.Template=new ControlTemplate(typeof(ToggleButton)){VisualTree=presenter};
-        System.Windows.Automation.AutomationProperties.SetName(toggle,label);
-        Action paint=delegate {
-            knob.HorizontalAlignment=showInSwitcher ? HorizontalAlignment.Right : HorizontalAlignment.Left;
-            track.Background=showInSwitcher ? Color("#217B66") : Color("#737780");
-        };
-        paint();
-        toggle.Click+=delegate {
-            showInSwitcher=toggle.IsChecked==true;
-            SavePreference("ShowInSwitcher",showInSwitcher?1:0);
-            SetSwitcher(this,showInSwitcher); paint();
-        };
-        DockPanel.SetDock(toggle,Dock.Right); switchRow.Children.Add(toggle);
-        switchRow.Children.Add(new TextBlock {Text=label,VerticalAlignment=VerticalAlignment.Center});
-        body.Children.Add(switchRow);
+        AddSwitch(body,T("دائمًا في المقدّمة","Always on top"),Topmost,delegate(bool enabled) {
+            ApplyTopmost(enabled);
+            SavePreference("AlwaysOnTop",enabled ? 1 : 0);
+        });
+        AddSwitch(body,T("إظهار الشريط في Alt+Tab","Show dock in Alt+Tab"),showInSwitcher,delegate(bool enabled) {
+            showInSwitcher=enabled; SetSwitcher(this,enabled);
+            SavePreference("ShowInSwitcher",enabled ? 1 : 0);
+        });
         Section(body,T("مكان الشريط","Dock position"),
             new[] { T("يسار","Left"),T("فوق","Top"),T("يمين","Right"),T("تحت","Bottom") },(int)edge,
             delegate(int i) {
@@ -917,7 +930,7 @@ class GameDock : Window {
     }
     void ShowSettings() {
         if (settingsWindow != null) { PositionSettings(); settingsWindow.Activate(); return; }
-        var w = new Window { Owner = this, Width = Math.Min(365,settingsAnchor.WorkArea.Width), SizeToContent = SizeToContent.Height,
+        var w = new Window { Owner = this, Topmost = this.Topmost, Width = Math.Min(365,settingsAnchor.WorkArea.Width), SizeToContent = SizeToContent.Height,
             MaxHeight = settingsAnchor.WorkArea.Height - 12, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
             WindowStartupLocation = WindowStartupLocation.Manual, FontFamily = new FontFamily("Segoe UI") };
         using (var source = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("GameDock.WhiteGlyph.ico")) {
@@ -939,6 +952,8 @@ class GameDock : Window {
     }
     GameDock(GameDock owner = null, Forms.Screen display = null) {
         host = owner ?? this;
+        Topmost = owner==null ? Preference("AlwaysOnTop",1,0,1)==1 : owner.Topmost;
+        ShowActivated=false;
         screen = display ?? Forms.Screen.PrimaryScreen;
         settingsAnchor = this;
         SourceInitialized += delegate { SetSwitcher(this,host==this && showInSwitcher); };
