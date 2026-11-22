@@ -17,6 +17,7 @@ internal static class GameArtwork {
     static readonly Dictionary<string,Task<BitmapSource>> pending=new Dictionary<string,Task<BitmapSource>>();
     static readonly Dictionary<string,BitmapSource> recent=new Dictionary<string,BitmapSource>();
     static readonly Queue<string> order=new Queue<string>();
+    static readonly Dictionary<string,string> savedSources=new Dictionary<string,string>();
     static long reconnectedAt;
     internal static void NetworkRestored() {Interlocked.Exchange(ref reconnectedAt,DateTime.UtcNow.Ticks);}
 
@@ -27,7 +28,7 @@ internal static class GameArtwork {
     internal static async Task<BitmapSource> Get(string title,string steamId,bool retry=false,string minecraftJar=null,bool online=true) {
         title=LookupTitle(title);
         if(title.Length==0 || title.Length>180) return null;
-        string key=steamId==null ? "title-"+Normalize(title) : "steam-"+steamId;
+        string key=GameKey(title,steamId);
         string requestKey=key+(retry ? ":refresh" : online ? ":lookup" : ":local");
         Task<BitmapSource> task;
         lock(pending) {
@@ -74,18 +75,23 @@ internal static class GameArtwork {
             small.Freeze(); return small;
         }
     }
-    static byte[] Fetch(string url,int limit) {
+    static byte[] Fetch(string url,int limit,bool prefix=false) {
         var request=(HttpWebRequest)WebRequest.Create(url);
         request.Timeout=5500; request.ReadWriteTimeout=5500; request.AllowAutoRedirect=false;
-        request.UserAgent="GameDock/1.7.1 (github.com/bakR012/GameDock)";
+        request.UserAgent="GameDock/1.7.2 (github.com/bakR012/GameDock)";
+        request.AutomaticDecompression=DecompressionMethods.GZip | DecompressionMethods.Deflate;
         using(var response=(HttpWebResponse)request.GetResponse())
         using(var stream=response.GetResponseStream())
         using(var copy=new MemoryStream()) {
-            if(response.ContentLength>limit) throw new InvalidDataException();
+            if(!prefix && response.ContentLength>limit) throw new InvalidDataException();
             var buf=new byte[8192]; int count;
             while((count=stream.Read(buf,0,buf.Length))>0) {
-                if(copy.Length+count>limit) throw new InvalidDataException();
+                if(copy.Length+count>limit) {
+                    if(!prefix) throw new InvalidDataException();
+                    copy.Write(buf,0,limit-(int)copy.Length); break;
+                }
                 copy.Write(buf,0,count);
+                if(prefix && copy.Length==limit) break;
             }
             return copy.ToArray();
         }
@@ -93,14 +99,15 @@ internal static class GameArtwork {
     static string Value(Dictionary<string,object> obj,string field) {
         object value; return obj!=null && obj.TryGetValue(field,out value) ? Convert.ToString(value) : "";
     }
-    internal static bool IsGameIconFile(string path,string title) {
+    internal static bool IsGameIconFile(string path,string title,bool verifiedGameExecutable=false) {
         if(!File.Exists(path)) return false;
         string ext=Path.GetExtension(path);
         if(String.Equals(ext,".ico",StringComparison.OrdinalIgnoreCase)) return true;
         if(!String.Equals(ext,".exe",StringComparison.OrdinalIgnoreCase) || GameScan.IsLauncher(path)) return false;
         try {
-            var info=System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
             string name=Normalize(title);
+            if(verifiedGameExecutable || (name.Length>0 && Normalize(Path.GetFileNameWithoutExtension(path))==name)) return true;
+            var info=System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
             return name.Length>0 && (Normalize(info.ProductName)==name || Normalize(info.FileDescription)==name);
         } catch(IOException) {return false;} catch(UnauthorizedAccessException) {return false;}
     }
@@ -188,6 +195,92 @@ internal static class GameArtwork {
         if(temporary && written.Ticks<Interlocked.Read(ref reconnectedAt)) return false;
         return written > DateTime.UtcNow.AddMinutes(temporary ? -15 : -720);
     }
+    internal static string PublisherSite(string title) {
+        switch(Normalize(LookupTitle(title))) {
+            case "leagueoflegends": return "https://www.leagueoflegends.com/en-us/";
+            case "valorant": return "https://playvalorant.com/en-us/";
+            case "teamfighttactics": return "https://teamfighttactics.leagueoflegends.com/en-us/";
+            case "fortnite": return "https://www.fortnite.com/";
+            default: return null;
+        }
+    }
+    internal static IEnumerable<string> PublisherIcons(string site,string html) {
+        var origin=new Uri(site);
+        var found=new HashSet<string>(StringComparer.Ordinal);
+        foreach(Match tag in Regex.Matches(html,@"<link\b[^>]{1,2048}>",RegexOptions.IgnoreCase)) {
+            string rel="",href="";
+            foreach(Match attr in Regex.Matches(tag.Value,@"\s(rel|href)\s*=\s*(?:""([^""]*)""|'([^']*)'|([^\s>]+))",RegexOptions.IgnoreCase)) {
+                string value=WebUtility.HtmlDecode(attr.Groups.Cast<Group>().Skip(2).First(g=>g.Success).Value);
+                if(attr.Groups[1].Value.Equals("rel",StringComparison.OrdinalIgnoreCase)) rel=value; else href=value;
+            }
+            if(href.Length==0 || !Regex.IsMatch(rel,@"(?:^|\s)(?:icon|apple-touch-icon)(?:\s|$)",RegexOptions.IgnoreCase)) continue;
+            Uri uri;
+            if(!Uri.TryCreate(origin,href,out uri) || uri.Scheme!="https" || !uri.IsDefaultPort || uri.UserInfo.Length!=0 ||
+               uri.AbsolutePath.EndsWith(".svg",StringComparison.OrdinalIgnoreCase)) continue;
+            bool riot=origin.Host!="www.fortnite.com";
+            if(uri.Host!=origin.Host && !(riot && (uri.Host=="cmsassets.rgpub.io" || uri.Host=="images.contentstack.io" || uri.Host=="brand.riotgames.com"))) continue;
+            if(found.Add(uri.AbsoluteUri)) yield return uri.AbsoluteUri;
+        }
+        string conventional=new Uri(origin,"/favicon.ico").AbsoluteUri;
+        if(found.Add(conventional)) yield return conventional;
+    }
+    static BitmapSource PublisherIcon(string site) {
+        string html="";
+        try {html=Encoding.UTF8.GetString(Fetch(site,98304,true));}
+        catch(WebException e) {if(e.Response!=null)e.Response.Dispose();}
+        foreach(string icon in PublisherIcons(site,html).Take(4)) {
+            try {return Decode(Fetch(icon,512000));}
+            catch(WebException e) {if(e.Response!=null)e.Response.Dispose();}
+            catch(IOException) {} catch(FormatException) {} catch(NotSupportedException) {} catch(InvalidDataException) {}
+        }
+        return null;
+    }
+    static string GameKey(string title,string steamId) {
+        return steamId==null ? "title-"+Normalize(LookupTitle(title)) : "steam-"+steamId;
+    }
+    static string CacheFile(string root,string key) {
+        using(var sha=SHA256.Create())
+            return Path.Combine(root,BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key))).Replace("-","")+".png");
+    }
+    // Store the last usable local pixels separately from a manually requested replacement.
+    internal static async Task RememberLocal(string title,string id,string source,BitmapSource image,string root=null) {
+        string file=CacheFile(root??folder,"local-"+GameKey(title,id)), stamp=null;
+        try {
+            DateTime modified=File.GetLastWriteTimeUtc(source);
+            stamp=source+"|"+modified.Ticks;
+            lock(savedSources) {
+                string previous;
+                if(savedSources.TryGetValue(file,out previous) && previous==stamp) return;
+                savedSources[file]=stamp;
+            }
+            await workers.WaitAsync().ConfigureAwait(false);
+            try {
+                await Task.Run(delegate {
+                    if(File.Exists(file) && File.GetLastWriteTimeUtc(file)==modified) return;
+                    Directory.CreateDirectory(Path.GetDirectoryName(file));
+                    string tmp=file+"."+Guid.NewGuid().ToString("N")+".tmp";
+                    try {
+                        var encoder=new PngBitmapEncoder();
+                        encoder.Frames.Add(BitmapFrame.Create(image));
+                        using(var stream=File.Create(tmp)) encoder.Save(stream);
+                        File.SetLastWriteTimeUtc(tmp,modified);
+                        lock(savedSources) {
+                            if(savedSources[file]!=stamp) return;
+                            if(File.Exists(file)) File.Replace(tmp,file,null); else File.Move(tmp,file);
+                        }
+                    } finally {if(File.Exists(tmp)) File.Delete(tmp);}
+                }).ConfigureAwait(false);
+            } finally {workers.Release();}
+        } catch(Exception) {lock(savedSources) {string current;if(savedSources.TryGetValue(file,out current) && current==stamp) savedSources.Remove(file);}}
+    }
+    internal static Task<BitmapSource> LastLocal(string title,string id,string root=null) {
+        return Task.Run(delegate {
+            try {
+                string file=CacheFile(root??folder,"local-"+GameKey(title,id));
+                return File.Exists(file) ? Decode(File.ReadAllBytes(file)) : null;
+            } catch(Exception) {return null;}
+        });
+    }
     internal static BitmapSource MinecraftIcon(string path) {
         using(var stream=File.OpenRead(path))
         using(var jar=new System.IO.Compression.ZipArchive(stream,System.IO.Compression.ZipArchiveMode.Read)) {
@@ -204,9 +297,8 @@ internal static class GameArtwork {
     internal static BitmapSource ReadOrFetch(string key,string title,string steamId,bool retry,string minecraftJar,bool online,string cacheRoot=null) {
         cacheRoot=cacheRoot??folder;
         Directory.CreateDirectory(cacheRoot);
-        string hash;
-        using(var sha=SHA256.Create()) hash=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key))).Replace("-","");
-        string path=Path.Combine(cacheRoot,hash+".png"), miss=path+".retry";
+        string site=steamId==null ? PublisherSite(title) : null;
+        string path=CacheFile(cacheRoot,key), miss=path+(site==null?".retry":".publisher.retry");
         if(!retry && File.Exists(path)) {
             try {return Decode(File.ReadAllBytes(path));} catch(Exception) {File.Delete(path);}
         }
@@ -218,6 +310,7 @@ internal static class GameArtwork {
                 try {image=MinecraftIcon(minecraftJar);} catch(IOException) {} catch(InvalidDataException) {}
             }
             if(image==null && (!online || (!retry && WaitBeforeRetry(miss)))) return null;
+            if(image==null && site!=null) image=PublisherIcon(site);
             if(image==null) {
                 try {
                     string uri=steamId==null && Normalize(title)=="minecraft"

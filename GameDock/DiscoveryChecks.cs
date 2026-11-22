@@ -36,7 +36,19 @@ internal static class DiscoveryChecks {
         var scan=new GameScan();
         scan.Riot(manifestRoot); scan.Shortcuts(links,true); scan.Consolidate();
         Check(scan.Games.Keys.SequenceEqual(new[]{"riot-league_of_legends"}),"live Riot game only, stale shortcuts and utilities ignored");
-        File.Delete(scan.Games.Values.First().Proof);
+        var league=scan.Games["riot-league_of_legends"];
+        Check(league.Icon==league.Proof && league.Icon!=client,"League uses its own executable when no product icon exists");
+        string leagueIcon=Write(@"m\Metadata\league_of_legends.live\league_of_legends.live.ico");
+        string valorantRoot=Path.Combine(root,"riot fixtures","valorant");
+        Write(Path.Combine(valorantRoot,@"ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"));
+        Write(@"m\Metadata\valorant.live\valorant.live.product_settings.yaml","product_install_full_path: \""+valorantRoot+"\"");
+        string valorantIcon=Write(@"m\Metadata\valorant.live\valorant.live.ico");
+        scan.Riot(manifestRoot);
+        Check(scan.Games["riot-valorant"].Icon==valorantIcon && scan.Games["riot-league_of_legends"].Icon==leagueIcon,"Riot product icons stay distinct on a custom install drive");
+        Check(GameArtwork.IsGameIconFile(scan.Games["riot-valorant"].Proof,"VALORANT",true) &&
+            !GameArtwork.IsGameIconFile(client,"VALORANT",true),"verified game executable can supply an icon but the shared client cannot");
+        File.Delete(scan.Games["riot-valorant"].Proof);
+        File.Delete(league.Proof);
         Write(@"custom drive\live\Logs\residual.log");
         scan=new GameScan(); scan.Riot(manifestRoot); scan.Consolidate();
         Check(scan.Games.Count==0,"uninstalled Riot game with leftover folder");
@@ -158,6 +170,16 @@ internal static class DiscoveryChecks {
             var url=Write("Custom.url","[InternetShortcut]\r\nURL=steam://rungameid/3278310\r\nIconFile="+shared);
             var steam=ManualGame.Read(url,shell);
             Check(steam.SteamId=="3278310" && steam.Icon==null,"URL ignores shared launcher icon");
+            string custom=Path.Combine(root,"my choice.ico");
+            using(var file=File.Create(custom)) System.Drawing.SystemIcons.Information.Save(file);
+            MakeLink(shell,linkPath,provider,"--game 2",custom);
+            Check(ManualGame.Read(linkPath,shell).Icon==custom,"arbitrarily named custom shortcut icon is preserved");
+            File.WriteAllText(url,"[InternetShortcut]\r\nURL=steam://rungameid/3278310\r\nIconFile="+custom);
+            Check(ManualGame.Read(url,shell).Icon==custom,"Steam shortcut retains the user's ICO");
+            var shortcuts=new GameScan();
+            shortcuts.Games.Add("steam-3278310",new InstalledGame {Title="Game",Icon=provider,Proof=provider});
+            shortcuts.Shortcuts(root,false);
+            Check(shortcuts.Games["steam-3278310"].ShortcutIcon==custom,"automatic mode respects a verified game's desktop icon");
         } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell);}
         const string icon="https://shared.fastly.steamstatic.com/community_assets/images/apps/1182900/eaebd6a8952539659e28725f90802cd1a4f93d37.jpg";
         const string cover="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1182900/capsule_184x69.jpg";
@@ -175,6 +197,14 @@ internal static class DiscoveryChecks {
         }
         Check(GameArtwork.MinecraftIcon(archive).PixelWidth==32,"read the game icon from the Minecraft client");
         var cache=Path.Combine(root,"cache");
+        var local=GameArtwork.Decode(Picture(32,32));
+        GameArtwork.RememberLocal("VALORANT",null,provider,local,cache).GetAwaiter().GetResult();
+        Check(GameArtwork.LastLocal("VALORANT",null,cache).GetAwaiter().GetResult().PixelWidth==32 &&
+            GameArtwork.LastLocal("League of Legends",null,cache).GetAwaiter().GetResult()==null,"local icon survives restart without leaking into another game");
+        string riotSite=GameArtwork.PublisherSite("LoL");
+        var links=GameArtwork.PublisherIcons(riotSite,"<link rel='preload' href='/cover.png'><link href='/league.ico' rel='shortcut icon'><link href='https://example.org/logo.png' rel='icon'>").ToArray();
+        Check(links.SequenceEqual(new[]{new Uri(new Uri(riotSite),"/league.ico").AbsoluteUri,new Uri(new Uri(riotSite),"/favicon.ico").AbsoluteUri}) &&
+            GameArtwork.PublisherSite("League of Legends PBE")==null,"publisher fallback accepts only game-site icon links and exact editions");
         Check(GameArtwork.ReadOrFetch("mc","Minecraft",null,false,archive,false,cache).PixelWidth==32,"offline local icon lookup");
         using(var zip=new System.IO.Compression.ZipArchive(File.Create(archive),System.IO.Compression.ZipArchiveMode.Create))
         using(var entry=zip.CreateEntry("icons/icon_32x32.png").Open()) {
@@ -188,7 +218,7 @@ internal static class DiscoveryChecks {
     static int Main(string[] args) {
         try {
             if(args.Contains("--online-icons")) {
-                foreach(string title in new[]{"Bloons TD 6","A Plague Tale Requiem","LANESPLIT","Minecraft"}) {
+                foreach(string title in new[]{"VALORANT","League of Legends","Teamfight Tactics","Fortnite","Bloons TD 6","A Plague Tale Requiem","LANESPLIT","Minecraft"}) {
                     var icon=GameArtwork.Get(title,null,true).GetAwaiter().GetResult();
                     Check(icon!=null && icon.PixelWidth==icon.PixelHeight,"live publisher icon for "+title);
                 }

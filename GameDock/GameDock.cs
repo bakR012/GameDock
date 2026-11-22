@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.7.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.7.2.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -331,7 +331,7 @@ class GameDock : Window {
                         InstalledGame before;
                         var after=result.Games[id];
                         return !previous.Games.TryGetValue(id,out before) || before.Title!=after.Title ||
-                            before.Icon!=after.Icon || before.Target!=after.Target || before.Arguments!=after.Arguments ||
+                            before.Icon!=after.Icon || before.ShortcutIcon!=after.ShortcutIcon || before.Target!=after.Target || before.Arguments!=after.Arguments ||
                             before.Proof!=after.Proof || before.Manifest!=after.Manifest;
                     })) Refresh();
                 }
@@ -555,23 +555,32 @@ class GameDock : Window {
             menu.Items.Add(item);
         }
         if(host.automatic || Link(path) || Url(path) || Paths.Equals(Path.GetExtension(path),".exe")) {
+            InstalledGame game;
+            ManualGame manual;
+            host.manualGames.TryGetValue(Path.GetFileName(path),out manual);
+            host.detected.Games.TryGetValue(path,out game);
+            string title=host.automatic && game!=null ? game.Title : manual!=null ? manual.Title : Path.GetFileNameWithoutExtension(path);
+            string iconKey=GameArtwork.Normalize(title);
+            string id=host.automatic && path.StartsWith("steam-") ? path.Substring(6) : manual==null ? null : manual.SteamId;
             var find=new MenuItem {Header=T("البحث عن أيقونة اللعبة","Find game icon")};
             find.Click+=async delegate {
-                InstalledGame game;
-                ManualGame manual;
-                host.manualGames.TryGetValue(Path.GetFileName(path),out manual);
-                host.detected.Games.TryGetValue(path,out game);
-                string title=host.automatic && game!=null ? game.Title : manual!=null ? manual.Title : Path.GetFileNameWithoutExtension(path);
-                string id=host.automatic && path.StartsWith("steam-") ? path.Substring(6) : manual==null ? null : manual.SteamId;
                 var art=await GameArtwork.Get(title,id,true,host.automatic && path=="prism-minecraft" && game!=null ? game.Proof : null);
                 if(closing) return;
                 if(art==null) {Alert(T("ما لقينا صورة مطابقة الآن. جرّب لاحقًا.","No matching game icon was available. Try again later."));return;}
                 try {
-                    Registry.SetValue(prefs+@"\Artwork",GameArtwork.Normalize(title),1);
+                    Registry.SetValue(prefs+@"\Artwork",iconKey,1);
                     Refresh();
                 } catch(Exception e) {Alert(e.Message);}
             };
             menu.Items.Add(find);
+            if(Object.Equals(ReadSetting(prefs+@"\Artwork",iconKey,0),1)) {
+                var restore=new MenuItem {Header=T("استخدام الأيقونة المحلية","Use local icon")};
+                restore.Click+=delegate {
+                    try {Registry.SetValue(prefs+@"\Artwork",iconKey,0); Refresh();}
+                    catch(Exception e) {Alert(e.Message);}
+                };
+                menu.Items.Add(restore);
+            }
         }
         var remove = new MenuItem { Header = T("إزالة من الشريط","Remove from dock") };
         remove.Click += delegate { RemoveEntry(path,false); };
@@ -1153,16 +1162,18 @@ class GameDock : Window {
         } catch (Exception e) { Alert(T("تعذّرت مراقبة المجلد. اختره مجدداً من القائمة.", "Could not monitor this folder. Choose it again in settings.") + "\n" + e.Message); }
         Refresh();
     }
-    Grid GameVisual(string title,string icon,string steamId,string minecraftJar=null) {
+    Grid GameVisual(string title,string icon,string steamId,string minecraftJar=null,string shortcutIcon=null,string gameExe=null) {
         var box=new Grid {Width=32,Height=32,ClipToBounds=true};
         BitmapSource art=null;
-        if(GameArtwork.IsGameIconFile(icon,title)) {
-            try {art=Paths.Equals(Path.GetExtension(icon),".ico") ? GameArtwork.ReadIconFile(icon) : GetIcon(icon,true);}
+        string source=null;
+        foreach(string file in new[]{shortcutIcon,icon,gameExe}.Where(p=>!String.IsNullOrEmpty(p)).Distinct(Paths)) {
+            if(!GameArtwork.IsGameIconFile(file,title,Paths.Equals(file,gameExe))) continue;
+            try {art=Paths.Equals(Path.GetExtension(file),".ico") ? GameArtwork.ReadIconFile(file) : GetIcon(file,true);}
             catch(ArgumentException) {} catch(COMException) {}
+            if(art!=null) {source=file; break;}
         }
         if(art!=null) {
             box.Children.Add(new Image {Source=art});
-            if(Paths.Equals(Path.GetExtension(icon),".ico") && !Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1)) return box;
         } else {
             box.Children.Add(new TextBlock {Text=String.IsNullOrWhiteSpace(title)?"?":System.Globalization.StringInfo.GetNextTextElement(title),
                 HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center,FontSize=19});
@@ -1171,7 +1182,15 @@ class GameDock : Window {
         loaded=async delegate {
                 box.Loaded-=loaded;
                 if(String.IsNullOrWhiteSpace(title)) return;
-                var fallback=await GameArtwork.Get(title,steamId,false,minecraftJar,host.downloadIcons);
+                bool repaired=Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1);
+                if(art!=null) await GameArtwork.RememberLocal(title,steamId,source,art);
+                if(art!=null && !repaired) return;
+                BitmapSource fallback=null;
+                if(repaired) fallback=await GameArtwork.Get(title,steamId,false,null,false);
+                if(fallback==null && art==null) {
+                    fallback=await GameArtwork.LastLocal(title,steamId);
+                    if(fallback==null) fallback=await GameArtwork.Get(title,steamId,false,minecraftJar,host.downloadIcons);
+                }
                 if(fallback!=null && box.IsLoaded) {
                     box.Children.Clear();
                     box.Children.Add(new Image {Source=fallback,Stretch=Stretch.Uniform});
@@ -1185,7 +1204,9 @@ class GameDock : Window {
         if (host.automatic) {
             InstalledGame game;
             if (!host.detected.Games.TryGetValue(entry,out game)) return new Button();
-            var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null,entry=="prism-minecraft" ? game.Proof : null);
+            string verifiedExe=(entry.StartsWith("riot-") || entry.StartsWith("gog-") || entry.StartsWith("xbox-") ||
+                entry.StartsWith("epic-") || entry.StartsWith("steam-") || entry.StartsWith("uplay-")) ? game.Proof : null;
+            var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null,entry=="prism-minecraft" ? game.Proof : null,game.ShortcutIcon,verifiedExe);
             var button=Tile(content,game.Title,delegate {
                 if(!GameScan.Ready(game)) {host.ScanGames();return;}
                 Launch(game.Target,game.LaunchArguments(host.lastMinecraftProfile));
@@ -1200,7 +1221,7 @@ class GameDock : Window {
         bool isGame=host.manualGames.TryGetValue(entry,out manual);
         string title=isGame ? manual.Title : entry;
         object visual;
-        if(isGame) visual=GameVisual(title,manual.Icon,manual.SteamId);
+        if(isGame) visual=GameVisual(title,manual.Icon,manual.SteamId,null,null,manual.TargetIcon);
         else {
             var image=GetIcon(path);
             visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};

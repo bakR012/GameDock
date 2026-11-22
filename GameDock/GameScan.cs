@@ -9,14 +9,14 @@ using System.Xml.Linq;
 using Microsoft.Win32;
 
 internal sealed class InstalledGame {
-    internal string Title, Target, Icon, Arguments, Proof, Manifest, PickerArguments;
+    internal string Title, Target, Icon, ShortcutIcon, Arguments, Proof, Manifest, PickerArguments;
     internal string LaunchArguments(bool lastProfile) {
         return !lastProfile && PickerArguments!=null ? PickerArguments : Arguments;
     }
 }
 
 internal sealed class ManualGame {
-    internal string Title, Icon, SteamId;
+    internal string Title, Icon, TargetIcon, SteamId;
     internal bool LauncherOnly;
 
     internal static ManualGame Read(string path,object shortcutShell) {
@@ -48,18 +48,25 @@ internal sealed class ManualGame {
             game.LauncherOnly=(prism && !profile) ||
                 (String.IsNullOrWhiteSpace(args) && (GameScan.IsLauncher(target) || GameScan.IsLauncher(title)) && game.SteamId==null);
             if(!game.LauncherOnly && String.IsNullOrWhiteSpace(args) && GameArtwork.IsGameIconFile(target,game.Title))
-                game.Icon=target;
+                game.TargetIcon=game.Icon=target;
             // Shell icons often belong to the application that opens the shortcut.
             if(!String.IsNullOrWhiteSpace(icon)) {
                 icon=Environment.ExpandEnvironmentVariables(icon.Trim().Trim('"'));
                 if(!Path.IsPathRooted(icon)) icon=Path.Combine(Path.GetDirectoryName(path),icon);
-                if(String.Equals(Path.GetExtension(icon),".ico",StringComparison.OrdinalIgnoreCase) &&
-                   GameArtwork.Normalize(Path.GetFileNameWithoutExtension(icon))==GameArtwork.Normalize(game.Title) && File.Exists(icon))
-                    game.Icon=icon;
+                game.Icon=ShortcutIcon(icon,target,args,game.Title) ?? game.Icon;
             }
         } catch(IOException) {} catch(UnauthorizedAccessException) {} catch(ArgumentException) {}
           catch(System.Runtime.InteropServices.COMException) {}
         return game;
+    }
+    internal static string ShortcutIcon(string icon,string target,string args,string title) {
+        if(String.IsNullOrWhiteSpace(icon) || !String.Equals(Path.GetExtension(icon),".ico",StringComparison.OrdinalIgnoreCase) ||
+           !File.Exists(icon) || new FileInfo(icon).Length==0) return null;
+        // A launcher may assign its own badge to every shortcut it creates.
+        if(!String.IsNullOrWhiteSpace(args) && Path.IsPathRooted(target) &&
+           String.Equals(Path.GetDirectoryName(icon),Path.GetDirectoryName(target),StringComparison.OrdinalIgnoreCase) &&
+           GameArtwork.Normalize(Path.GetFileNameWithoutExtension(icon))!=GameArtwork.Normalize(title)) return null;
+        return icon;
     }
 }
 
@@ -132,6 +139,8 @@ internal sealed class GameScan {
             string key=GameArtwork.Normalize(game.Title), winner;
             if(key.Length==0) {Games.Remove(pair.Key);continue;}
             if(names.TryGetValue(key,out winner) || proofs.TryGetValue(game.Proof,out winner)) {
+                if(Games[winner].ShortcutIcon==null && String.Equals(Games[winner].Proof,game.Proof,StringComparison.OrdinalIgnoreCase))
+                    Games[winner].ShortcutIcon=game.ShortcutIcon;
                 Aliases[pair.Key]=winner; Games.Remove(pair.Key);
             } else winner=pair.Key;
             names[key]=winner; proofs[game.Proof]=winner;
@@ -171,7 +180,9 @@ internal sealed class GameScan {
             }
             string proof=binaries.Select(p=>Child(location,p)).FirstOrDefault(File.Exists);
             if(proof==null) return;
-            Games["riot-"+parts[0]] = new InstalledGame {Title=title,Proof=proof,Manifest=file,Target=client,Icon=proof,Arguments="--launch-product="+parts[0]+" --launch-patchline=live"};
+            string productIcon=Path.Combine(dir,name+".ico");
+            Watch(dir,name+".ico");
+            Games["riot-"+parts[0]] = new InstalledGame {Title=title,Proof=proof,Manifest=file,Target=client,Icon=File.Exists(productIcon)?productIcon:proof,Arguments="--launch-product="+parts[0]+" --launch-patchline=live"};
         });
     }
     // A Ubisoft shortcut can outlive its game. Require a registered install and an executable.
@@ -212,12 +223,33 @@ internal sealed class GameScan {
             foreach (var file in Directory.EnumerateFiles(directory)) Try(delegate {
                 string ext = Path.GetExtension(file).ToLowerInvariant();
                 string title = Path.GetFileNameWithoutExtension(file);
-                string target = file, args = "", id = null;
-                if (ext == ".url") {UbisoftShortcut(file,title);return;}
+                string target = file, args = "", id = null, candidateIcon=null;
+                if (ext == ".url") {
+                    UbisoftShortcut(file,title);
+                    var manual=ManualGame.Read(file,null);
+                    InstalledGame installed;
+                    if(manual.SteamId!=null && Games.TryGetValue("steam-"+manual.SteamId,out installed) && installed.ShortcutIcon==null)
+                        installed.ShortcutIcon=manual.Icon;
+                    return;
+                }
                 if (ext == ".lnk") {
                     dynamic link = shell.CreateShortcut(file);
-                    try { target = link.TargetPath; args = link.Arguments ?? ""; }
+                    string spec;
+                    try { target = link.TargetPath; args = link.Arguments ?? ""; spec=link.IconLocation ?? ""; }
                     finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(link); }
+                    int comma=spec.LastIndexOf(',');
+                    string candidate=Environment.ExpandEnvironmentVariables((comma<0?spec:spec.Substring(0,comma)).Trim().Trim('"'));
+                    if(candidate.Length>0 && !Path.IsPathRooted(candidate)) candidate=Path.Combine(directory,candidate);
+                    string chosen=ManualGame.ShortcutIcon(candidate,target,args,title);
+                    if(chosen!=null) {
+                        foreach(var installed in Games.Values) {
+                            bool sameExe=String.Equals(target,installed.Proof,StringComparison.OrdinalIgnoreCase);
+                            bool sameLaunch=String.Equals(target,installed.Target,StringComparison.OrdinalIgnoreCase) &&
+                                String.Equals(args.Trim(),(installed.Arguments??"").Trim(),StringComparison.OrdinalIgnoreCase);
+                            if((sameExe || sameLaunch) && installed.ShortcutIcon==null) installed.ShortcutIcon=chosen;
+                        }
+                    }
+                    candidateIcon=chosen;
                 } else if (ext != ".exe" || !curated) return;
                 // A store URL proves ownership of a shortcut, not installation of the game.
                 if (!File.Exists(target) || !String.Equals(Path.GetExtension(target),".exe",StringComparison.OrdinalIgnoreCase)) return;
@@ -228,7 +260,7 @@ internal sealed class GameScan {
                 bool godot=File.Exists(Path.ChangeExtension(target,".pck")) && (System.Diagnostics.FileVersionInfo.GetVersionInfo(target).ProductName??"").IndexOf("Godot",StringComparison.OrdinalIgnoreCase)>=0;
                 if(!unity && !unreal && !godot) return;
                 id=target+" "+args;
-                Games[id]=new InstalledGame {Title=title,Target=file,Proof=target};
+                Games[id]=new InstalledGame {Title=title,Target=file,Proof=target,ShortcutIcon=candidateIcon};
             });
         } finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell); }
     }
@@ -338,7 +370,9 @@ internal sealed class GameScan {
             if(!task.TryGetValue("isPrimary",out primary) || !Object.Equals(primary,true) || !String.Equals(Text(task,"type"),"File",StringComparison.OrdinalIgnoreCase)) continue;
             string exe=Child(root,Text(task,"path"));
             if(!File.Exists(exe) || !String.Equals(Path.GetExtension(exe),".exe",StringComparison.OrdinalIgnoreCase) || Utility(exe)) continue;
-            Games["gog-"+gameId]=new InstalledGame {Title=Text(item,"name"),Target=exe,Arguments=Text(task,"arguments"),Proof=exe,Icon=exe,Manifest=manifest};
+            string icon=Path.ChangeExtension(manifest,".ico");
+            Watch(root,Path.GetFileName(icon));
+            Games["gog-"+gameId]=new InstalledGame {Title=Text(item,"name"),Target=exe,Arguments=Text(task,"arguments"),Proof=exe,Icon=File.Exists(icon)?icon:exe,Manifest=manifest};
             break;
         }
     }
