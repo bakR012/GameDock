@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.7.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.7.1.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -288,6 +288,8 @@ class GameDock : Window {
     const string HiddenKey = prefs + @"\Hidden";
     string[] HiddenNames() { return ReadSetting(HiddenKey,OrderName,null) as string[] ?? new string[0]; }
     bool automatic = Preference("AutomaticGames",1,0,1) == 1;
+    bool downloadIcons=Preference("AutoDownloadIcons",1,0,1)==1;
+    bool lastMinecraftProfile=Preference("LastMinecraftProfile",0,0,1)==1;
     GameScan detected = new GameScan();
     readonly Dictionary<string,FileSystemWatcher> gameWatchers = new Dictionary<string,FileSystemWatcher>(StringComparer.OrdinalIgnoreCase);
     bool scanning, rescan;
@@ -344,7 +346,9 @@ class GameDock : Window {
         foreach (var watcher in gameWatchers.Values) watcher.Dispose();
         gameWatchers.Clear();
     }
+    readonly Dictionary<string,ManualGame> manualGames=new Dictionary<string,ManualGame>(Paths);
     string[] Entries() {
+        manualGames.Clear();
         if (host.automatic) {
             var ids = host.detected.Games.OrderBy(pair=>pair.Value.Title,StringComparer.CurrentCultureIgnoreCase).Select(pair=>pair.Key).ToArray();
             var order = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
@@ -359,6 +363,16 @@ class GameDock : Window {
         var entries = items
             .Where(f => (f.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
             .Select(f => f.Name).OrderBy(n => n,StringComparer.CurrentCultureIgnoreCase).ToArray();
+        object shortcutShell=null;
+        try {
+            foreach(var name in entries.Distinct(Paths)) {
+                string path=InFolder(name);
+                if(!Link(path) && !Url(path) && !Paths.Equals(Path.GetExtension(path),".exe")) continue;
+                if(Link(path) && shortcutShell==null) shortcutShell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                manualGames[name]=ManualGame.Read(path,shortcutShell);
+            }
+        } finally {if(shortcutShell!=null) Marshal.FinalReleaseComObject(shortcutShell);}
+        entries=entries.Where(name=>!manualGames.ContainsKey(name) || !manualGames[name].LauncherOnly).ToArray();
         var saved = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
         return saved.Intersect(entries,Paths).Concat(entries.Except(saved,Paths)).Except(HiddenNames(),Paths).ToArray();
     }
@@ -541,14 +555,17 @@ class GameDock : Window {
             menu.Items.Add(item);
         }
         if(host.automatic || Link(path) || Url(path) || Paths.Equals(Path.GetExtension(path),".exe")) {
-            var find=new MenuItem {Header=T("البحث عن أيقونة اللعبة","Find game artwork")};
+            var find=new MenuItem {Header=T("البحث عن أيقونة اللعبة","Find game icon")};
             find.Click+=async delegate {
                 InstalledGame game;
-                string title=host.automatic && host.detected.Games.TryGetValue(path,out game) ? game.Title : Path.GetFileNameWithoutExtension(path);
-                string id=host.automatic && path.StartsWith("steam-") ? path.Substring(6) : ManualSteamId(path);
-                var art=await GameArtwork.Get(title,id,true);
+                ManualGame manual;
+                host.manualGames.TryGetValue(Path.GetFileName(path),out manual);
+                host.detected.Games.TryGetValue(path,out game);
+                string title=host.automatic && game!=null ? game.Title : manual!=null ? manual.Title : Path.GetFileNameWithoutExtension(path);
+                string id=host.automatic && path.StartsWith("steam-") ? path.Substring(6) : manual==null ? null : manual.SteamId;
+                var art=await GameArtwork.Get(title,id,true,host.automatic && path=="prism-minecraft" && game!=null ? game.Proof : null);
                 if(closing) return;
-                if(art==null) {Alert(T("ما لقينا صورة مطابقة الآن. جرّب لاحقًا.","No matching artwork was available. Try again later."));return;}
+                if(art==null) {Alert(T("ما لقينا صورة مطابقة الآن. جرّب لاحقًا.","No matching game icon was available. Try again later."));return;}
                 try {
                     Registry.SetValue(prefs+@"\Artwork",GameArtwork.Normalize(title),1);
                     Refresh();
@@ -974,6 +991,13 @@ class GameDock : Window {
             else { StopGameWatchers(); Bind(); }
         });
         var files = new WrapPanel { Margin = new Thickness(0,12,0,3) };
+        AddSwitch(body,T("تنزيل أيقونات الألعاب تلقائيًا","Download game icons automatically"),downloadIcons,delegate(bool on) {
+            downloadIcons=on; SavePreference("AutoDownloadIcons",on ? 1 : 0); Refresh();
+        });
+        if(automatic) Section(body,T("عند فتح Minecraft من Prism","When opening Minecraft with Prism"),
+            new[]{T("اختيار النسخة","Choose a profile"),T("آخر نسخة لعبتها","Last played profile")},lastMinecraftProfile ? 1 : 0,delegate(int i) {
+                lastMinecraftProfile=i==1; SavePreference("LastMinecraftProfile",i);
+            });
         files.Children.Add(SettingButton(T("فتح المجلد","Open folder"), delegate { Launch(folder); }, false));
         files.Children.Add(SettingButton(T("تغيير المجلد","Change folder"), Choose, false));
         if (automatic) body.Children.Add(SettingButton(T("تحديث قائمة الألعاب","Refresh detected games"),ScanGames,false));
@@ -1055,11 +1079,13 @@ class GameDock : Window {
         if (host == this) {
             SystemParameters.StaticPropertyChanged += SystemChanged;
             SystemEvents.DisplaySettingsChanged += DisplayChanged;
+            System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged+=NetworkChanged;
         }
         Closed += delegate {
             closing = true; ReleaseTray(); StopGameWatchers();
             if (host == this) {
                 SystemEvents.DisplaySettingsChanged -= DisplayChanged;
+                System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged-=NetworkChanged;
                 foreach (var mirror in mirrors.ToArray()) mirror.Close();
                 mirrors.Clear();
             }
@@ -1073,6 +1099,11 @@ class GameDock : Window {
         Left = edge == Dock.Left ? area.Left + 8 : edge == Dock.Right ? area.Right - ActualWidth - 8 : area.Left + (area.Width - ActualWidth)/2;
         Top = edge == Dock.Top ? area.Top + 8 : edge == Dock.Bottom ? area.Bottom - ActualHeight - 8 : area.Top + (area.Height - ActualHeight)/2;
         PositionSettings();
+    }
+    void NetworkChanged(object sender,System.Net.NetworkInformation.NetworkAvailabilityEventArgs e) {
+        if(!e.IsAvailable || Dispatcher.HasShutdownStarted) return;
+        GameArtwork.NetworkRestored();
+        Dispatcher.BeginInvoke(new Action(delegate {if(!closing && downloadIcons && IsLoaded) Refresh();}));
     }
     void PositionSettings() {
         var w = settingsWindow;
@@ -1122,60 +1153,31 @@ class GameDock : Window {
         } catch (Exception e) { Alert(T("تعذّرت مراقبة المجلد. اختره مجدداً من القائمة.", "Could not monitor this folder. Choose it again in settings.") + "\n" + e.Message); }
         Refresh();
     }
-    static string ManualSteamId(string path) {
-        if(!Url(path) || !File.Exists(path)) return null;
-        try {
-            var line=File.ReadLines(path).Take(80).FirstOrDefault(l=>l.StartsWith("URL=",StringComparison.OrdinalIgnoreCase));
-            var match=System.Text.RegularExpressions.Regex.Match(line??"", @"^URL=steam://(?:run|rungameid)/(\d+)/?$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            return match.Success ? match.Groups[1].Value : null;
-        } catch(IOException) {} catch(UnauthorizedAccessException) {}
-        return null;
-    }
-    static string ShortcutIcon(string path) {
-        try {
-            if(Url(path)) {
-                string entry=File.ReadLines(path).Take(80).FirstOrDefault(l=>l.StartsWith("IconFile=",StringComparison.OrdinalIgnoreCase));
-                string file=entry==null ? "" : Environment.ExpandEnvironmentVariables(entry.Substring(9).Trim().Trim('"'));
-                return File.Exists(file) ? path : null;
-            }
-            if(Link(path)) {
-                string icon=path;
-                WithLink(path,delegate(dynamic link) {
-                    string spec=(string)link.IconLocation??"";
-                    int comma=spec.LastIndexOf(',');
-                    string file=Environment.ExpandEnvironmentVariables((comma<0?spec:spec.Substring(0,comma)).Trim().Trim('"'));
-                    string target=(string)link.TargetPath??"";
-                    if(!File.Exists(file) && (!File.Exists(target) || GameScan.IsLauncher(target))) icon=null;
-                    else if(!File.Exists(file)) icon=target;
-                    else if(GameScan.IsLauncher(file)) icon=null;
-                });
-                return icon;
-            }
-        } catch(Exception) {return null;}
-        return path;
-    }
-    Grid GameVisual(string title,string icon,string steamId) {
+    Grid GameVisual(string title,string icon,string steamId,string minecraftJar=null) {
         var box=new Grid {Width=32,Height=32,ClipToBounds=true};
         BitmapSource art=null;
-        if(!Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1) && !String.IsNullOrEmpty(icon) && File.Exists(icon)) {
-            try {art=GetIcon(icon,true);} catch(ArgumentException) {} catch(COMException) {}
+        if(GameArtwork.IsGameIconFile(icon,title)) {
+            try {art=Paths.Equals(Path.GetExtension(icon),".ico") ? GameArtwork.ReadIconFile(icon) : GetIcon(icon,true);}
+            catch(ArgumentException) {} catch(COMException) {}
         }
-        if(art!=null) box.Children.Add(new Image {Source=art});
-        else {
+        if(art!=null) {
+            box.Children.Add(new Image {Source=art});
+            if(Paths.Equals(Path.GetExtension(icon),".ico") && !Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1)) return box;
+        } else {
             box.Children.Add(new TextBlock {Text=String.IsNullOrWhiteSpace(title)?"?":System.Globalization.StringInfo.GetNextTextElement(title),
                 HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center,FontSize=19});
-            RoutedEventHandler loaded=null;
-            loaded=async delegate {
+        }
+        RoutedEventHandler loaded=null;
+        loaded=async delegate {
                 box.Loaded-=loaded;
                 if(String.IsNullOrWhiteSpace(title)) return;
-                var fallback=await GameArtwork.Get(title,steamId);
+                var fallback=await GameArtwork.Get(title,steamId,false,minecraftJar,host.downloadIcons);
                 if(fallback!=null && box.IsLoaded) {
                     box.Children.Clear();
-                    box.Children.Add(new Image {Source=fallback,Stretch=Stretch.UniformToFill});
+                    box.Children.Add(new Image {Source=fallback,Stretch=Stretch.Uniform});
                 }
             };
-            box.Loaded+=loaded;
-        }
+        box.Loaded+=loaded;
         return box;
     }
     Button EntryTile(int index) {
@@ -1183,10 +1185,10 @@ class GameDock : Window {
         if (host.automatic) {
             InstalledGame game;
             if (!host.detected.Games.TryGetValue(entry,out game)) return new Button();
-            var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null);
+            var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null,entry=="prism-minecraft" ? game.Proof : null);
             var button=Tile(content,game.Title,delegate {
                 if(!GameScan.Ready(game)) {host.ScanGames();return;}
-                Launch(game.Target,game.Arguments);
+                Launch(game.Target,game.LaunchArguments(host.lastMinecraftProfile));
             },true);
             EnableDrag(button,entry);
             Canvas.SetLeft(button,Side ? 0 : index*(double)Slot);
@@ -1194,11 +1196,11 @@ class GameDock : Window {
             return button;
         }
         string path = InFolder(entry);
-        bool shortcut=File.Exists(path) && (Link(path) || Url(path));
-        bool executable=String.Equals(Path.GetExtension(path),".exe",StringComparison.OrdinalIgnoreCase);
-        string title=shortcut || executable ? Path.GetFileNameWithoutExtension(entry) : entry;
+        ManualGame manual;
+        bool isGame=host.manualGames.TryGetValue(entry,out manual);
+        string title=isGame ? manual.Title : entry;
         object visual;
-        if(shortcut || executable) visual=GameVisual(title,shortcut ? ShortcutIcon(path) : path,ManualSteamId(path));
+        if(isGame) visual=GameVisual(title,manual.Icon,manual.SteamId);
         else {
             var image=GetIcon(path);
             visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};

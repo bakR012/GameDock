@@ -9,7 +9,58 @@ using System.Xml.Linq;
 using Microsoft.Win32;
 
 internal sealed class InstalledGame {
-    internal string Title, Target, Icon, Arguments, Proof, Manifest;
+    internal string Title, Target, Icon, Arguments, Proof, Manifest, PickerArguments;
+    internal string LaunchArguments(bool lastProfile) {
+        return !lastProfile && PickerArguments!=null ? PickerArguments : Arguments;
+    }
+}
+
+internal sealed class ManualGame {
+    internal string Title, Icon, SteamId;
+    internal bool LauncherOnly;
+
+    internal static ManualGame Read(string path,object shortcutShell) {
+        var title=Path.GetFileNameWithoutExtension(path);
+        var game=new ManualGame {Title=title};
+        string target=path, args="", icon=null;
+        string ext=Path.GetExtension(path).ToLowerInvariant();
+        try {
+            if(ext==".lnk" && shortcutShell!=null) {
+                dynamic link=((dynamic)shortcutShell).CreateShortcut(path);
+                try {
+                    target=(string)link.TargetPath??"";
+                    args=(string)link.Arguments??"";
+                    string spec=(string)link.IconLocation??"";
+                    int comma=spec.LastIndexOf(',');
+                    icon=comma<0 ? spec : spec.Substring(0,comma);
+                } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(link);}
+            } else if(ext==".url") {
+                foreach(string line in File.ReadLines(path).Take(80)) {
+                    if(line.StartsWith("URL=",StringComparison.OrdinalIgnoreCase)) target=line.Substring(4).Trim();
+                    if(line.StartsWith("IconFile=",StringComparison.OrdinalIgnoreCase)) icon=line.Substring(9);
+                }
+                var steam=Regex.Match(target,@"^steam://(?:run|rungameid)/(\d+)/?$",RegexOptions.IgnoreCase);
+                if(steam.Success) game.SteamId=steam.Groups[1].Value;
+            }
+            bool prism=GameScan.IsPrism(target);
+            bool profile=prism && Regex.IsMatch(args,@"(?:^|\s)(?:--launch|-l)\s+(?:""[^""]+""|[^\s""]+)",RegexOptions.IgnoreCase);
+            if(profile && GameScan.IsPrism(title)) game.Title="Minecraft";
+            game.LauncherOnly=(prism && !profile) ||
+                (String.IsNullOrWhiteSpace(args) && (GameScan.IsLauncher(target) || GameScan.IsLauncher(title)) && game.SteamId==null);
+            if(!game.LauncherOnly && String.IsNullOrWhiteSpace(args) && GameArtwork.IsGameIconFile(target,game.Title))
+                game.Icon=target;
+            // Shell icons often belong to the application that opens the shortcut.
+            if(!String.IsNullOrWhiteSpace(icon)) {
+                icon=Environment.ExpandEnvironmentVariables(icon.Trim().Trim('"'));
+                if(!Path.IsPathRooted(icon)) icon=Path.Combine(Path.GetDirectoryName(path),icon);
+                if(String.Equals(Path.GetExtension(icon),".ico",StringComparison.OrdinalIgnoreCase) &&
+                   GameArtwork.Normalize(Path.GetFileNameWithoutExtension(icon))==GameArtwork.Normalize(game.Title) && File.Exists(icon))
+                    game.Icon=icon;
+            }
+        } catch(IOException) {} catch(UnauthorizedAccessException) {} catch(ArgumentException) {}
+          catch(System.Runtime.InteropServices.COMException) {}
+        return game;
+    }
 }
 
 internal sealed class GameScan {
@@ -48,8 +99,18 @@ internal sealed class GameScan {
         string matched;
         return Aliases.TryGetValue(id,out matched) ? matched : id;
     }
+    static string ProgramName(string file) {
+        if(String.IsNullOrWhiteSpace(file) || file.IndexOf("://",StringComparison.Ordinal)>=0) return "";
+        string name=Path.GetFileName(file);
+        if(name.EndsWith(".exe",StringComparison.OrdinalIgnoreCase)) name=Path.GetFileNameWithoutExtension(name);
+        return GameArtwork.Normalize(name);
+    }
+    internal static bool IsPrism(string file) {
+        string name=ProgramName(file);
+        return name=="prismlauncher" || name=="multimc";
+    }
     internal static bool IsLauncher(string file) {
-        return Regex.IsMatch(Path.GetFileNameWithoutExtension(file)??"", @"^(?:steam|epicgameslauncher|riotclientservices|prismlauncher|multimc|minecraftlauncher|ubisoftconnect|upc|battle\.net|galaxyclient|eadesktop|explorer)$",RegexOptions.IgnoreCase);
+        return Regex.IsMatch(ProgramName(file),@"^(?:steam|epicgameslauncher|riotclientservices|prismlauncher|multimc|minecraftlauncher|ubisoftconnect|upc|battlenet|galaxyclient|eadesktop|explorer|ankerlauncher|ankergameslauncher)$");
     }
     static bool Utility(string file) {
         string name=Path.GetFileNameWithoutExtension(file);
@@ -167,7 +228,7 @@ internal sealed class GameScan {
                 bool godot=File.Exists(Path.ChangeExtension(target,".pck")) && (System.Diagnostics.FileVersionInfo.GetVersionInfo(target).ProductName??"").IndexOf("Godot",StringComparison.OrdinalIgnoreCase)>=0;
                 if(!unity && !unreal && !godot) return;
                 id=target+" "+args;
-                Games[id]=new InstalledGame {Title=title,Icon=target,Target=file,Proof=target};
+                Games[id]=new InstalledGame {Title=title,Target=file,Proof=target};
             });
         } finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell); }
     }
@@ -209,13 +270,14 @@ internal sealed class GameScan {
             if(last>latest || (last==latest && String.CompareOrdinal(id,best)<0)) {best=id; latest=last; jar=candidate;}
         });
         if(best!=null) {
-            Games["prism-minecraft"]=new InstalledGame {Title="Minecraft",Target=exe,Proof=jar,Arguments="--dir \""+home.TrimEnd('\\')+"\" --launch \""+best+"\""};
+            string picker="--dir \""+home.TrimEnd('\\')+"\"";
+            Games["prism-minecraft"]=new InstalledGame {Title="Minecraft",Target=exe,Proof=jar,PickerArguments=picker,Arguments=picker+" --launch \""+best+"\""};
             foreach(var dir in instances) Aliases["prism:"+dir]="prism-minecraft";
         }
     }
     void AddExternal(string id,string title,string exe) {
         if (String.IsNullOrWhiteSpace(title) || Games.ContainsKey(id) || Utility(exe)) return;
-        Games[id]=new InstalledGame {Title=title,Target=exe,Icon=exe,Proof=exe};
+        Games[id]=new InstalledGame {Title=title,Target=exe,Proof=exe};
     }
     internal void Anker(string data) {
         string library=Path.Combine(data,"library.json");

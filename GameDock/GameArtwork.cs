@@ -12,49 +12,62 @@ using System.Windows.Media.Imaging;
 using System.Text.RegularExpressions;
 
 internal static class GameArtwork {
-    static readonly string folder=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"GameDock","Artwork");
+    static readonly string folder=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"GameDock","GameIcons-v1");
     static readonly SemaphoreSlim workers=new SemaphoreSlim(2);
     static readonly Dictionary<string,Task<BitmapSource>> pending=new Dictionary<string,Task<BitmapSource>>();
     static readonly Dictionary<string,BitmapSource> recent=new Dictionary<string,BitmapSource>();
     static readonly Queue<string> order=new Queue<string>();
+    static long reconnectedAt;
+    internal static void NetworkRestored() {Interlocked.Exchange(ref reconnectedAt,DateTime.UtcNow.Ticks);}
 
     static GameArtwork() { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; }
     internal static string Normalize(string title) {
         return Regex.Replace((title??"").Replace("™","").Replace("®","").Replace("+"," plus ").Normalize(NormalizationForm.FormKC).ToLowerInvariant(),@"[^\p{L}\p{Nd}]","");
     }
-    internal static async Task<BitmapSource> Get(string title,string steamId,bool retry=false) {
+    internal static async Task<BitmapSource> Get(string title,string steamId,bool retry=false,string minecraftJar=null,bool online=true) {
         title=LookupTitle(title);
         if(title.Length==0 || title.Length>180) return null;
         string key=steamId==null ? "title-"+Normalize(title) : "steam-"+steamId;
+        string requestKey=key+(retry ? ":refresh" : online ? ":lookup" : ":local");
         Task<BitmapSource> task;
         lock(pending) {
             BitmapSource cached;
-            if(recent.TryGetValue(key,out cached)) return cached;
-            if(!pending.TryGetValue(key,out task)) {
-                task=Load(key,title,steamId,retry);
-                pending.Add(key,task);
+            if(!retry && recent.TryGetValue(key,out cached)) return cached;
+            if(!pending.TryGetValue(requestKey,out task)) {
+                task=Load(key,title,steamId,retry,minecraftJar,online);
+                pending.Add(requestKey,task);
             }
         }
         var result=await task.ConfigureAwait(false);
         lock(pending) {
-            if(pending.Remove(key) && result!=null) {
-                if(order.Count>=64) recent.Remove(order.Dequeue());
-                recent[key]=result; order.Enqueue(key);
+            Task<BitmapSource> current;
+            if(pending.TryGetValue(requestKey,out current) && current==task) {
+                pending.Remove(requestKey);
+                if(result==null) return null;
+                if(!recent.ContainsKey(key)) {
+                    if(order.Count>=64) recent.Remove(order.Dequeue());
+                    order.Enqueue(key);
+                }
+                recent[key]=result;
             }
         }
         return result;
     }
-    static async Task<BitmapSource> Load(string key,string title,string steamId,bool retry) {
+    static async Task<BitmapSource> Load(string key,string title,string steamId,bool retry,string minecraftJar,bool online) {
         await workers.WaitAsync().ConfigureAwait(false);
-        try { return await Task.Run(()=>ReadOrFetch(key,title,steamId,retry)).ConfigureAwait(false); }
+        try { return await Task.Run(()=>ReadOrFetch(key,title,steamId,retry,minecraftJar,online)).ConfigureAwait(false); }
         catch(Exception) { return null; }
         finally { workers.Release(); }
     }
-    static BitmapSource Decode(byte[] data) {
+    internal static BitmapSource Decode(byte[] data) {
         using(var input=new MemoryStream(data)) {
+            var decoder=BitmapDecoder.Create(input,BitmapCreateOptions.DelayCreation,BitmapCacheOption.None);
+            var frame=decoder.Frames[0];
+            if(frame.PixelWidth<16 || frame.PixelWidth!=frame.PixelHeight || frame.PixelWidth>1024) throw new InvalidDataException("Expected a square game icon.");
+            input.Position=0;
             var image=new BitmapImage();
             image.BeginInit(); image.CacheOption=BitmapCacheOption.OnLoad;
-            image.DecodePixelWidth=96; image.StreamSource=input; image.EndInit();
+            image.DecodePixelWidth=Math.Min(96,frame.PixelWidth); image.StreamSource=input; image.EndInit();
             if(image.PixelHeight<4 || image.PixelHeight>512) throw new InvalidDataException();
             // Detach the thumbnail from the encoded source and its MemoryStream.
             var small=new WriteableBitmap(image);
@@ -64,7 +77,7 @@ internal static class GameArtwork {
     static byte[] Fetch(string url,int limit) {
         var request=(HttpWebRequest)WebRequest.Create(url);
         request.Timeout=5500; request.ReadWriteTimeout=5500; request.AllowAutoRedirect=false;
-        request.UserAgent="GameDock/1.7 (github.com/bakR012/GameDock)";
+        request.UserAgent="GameDock/1.7.1 (github.com/bakR012/GameDock)";
         using(var response=(HttpWebResponse)request.GetResponse())
         using(var stream=response.GetResponseStream())
         using(var copy=new MemoryStream()) {
@@ -77,11 +90,38 @@ internal static class GameArtwork {
             return copy.ToArray();
         }
     }
-    static Dictionary<string,object> Json(string url) {
-        return new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(Encoding.UTF8.GetString(Fetch(url,196608)));
-    }
     static string Value(Dictionary<string,object> obj,string field) {
         object value; return obj!=null && obj.TryGetValue(field,out value) ? Convert.ToString(value) : "";
+    }
+    internal static bool IsGameIconFile(string path,string title) {
+        if(!File.Exists(path)) return false;
+        string ext=Path.GetExtension(path);
+        if(String.Equals(ext,".ico",StringComparison.OrdinalIgnoreCase)) return true;
+        if(!String.Equals(ext,".exe",StringComparison.OrdinalIgnoreCase) || GameScan.IsLauncher(path)) return false;
+        try {
+            var info=System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
+            string name=Normalize(title);
+            return name.Length>0 && (Normalize(info.ProductName)==name || Normalize(info.FileDescription)==name);
+        } catch(IOException) {return false;} catch(UnauthorizedAccessException) {return false;}
+    }
+    internal static BitmapSource ReadIconFile(string path) {
+        try {
+            var file=new FileInfo(path);
+            if(!file.Exists || file.Length>2097152) return null;
+            using(var input=File.OpenRead(path)) {
+                var decoder=new IconBitmapDecoder(input,BitmapCreateOptions.PreservePixelFormat,BitmapCacheOption.OnLoad);
+                var frame=decoder.Frames.Where(f=>f.PixelWidth==f.PixelHeight && f.PixelWidth>=16 && f.PixelWidth<=512)
+                    .OrderBy(f=>Math.Abs(f.PixelWidth-32)).ThenByDescending(f=>f.Format.BitsPerPixel).FirstOrDefault();
+                if(frame==null) return null;
+                var bitmap=new System.Windows.Media.Imaging.FormatConvertedBitmap(frame,System.Windows.Media.PixelFormats.Bgra32,null,0);
+                int stride=bitmap.PixelWidth*4;
+                var pixels=new byte[stride*bitmap.PixelHeight];
+                bitmap.CopyPixels(pixels,stride,0);
+                for(int i=3;i<pixels.Length;i+=4) if(pixels[i]>0) {bitmap.Freeze();return bitmap;}
+            }
+        } catch(IOException) {} catch(UnauthorizedAccessException) {} catch(FormatException) {}
+          catch(NotSupportedException) {} catch(ArgumentException) {} catch(System.Runtime.InteropServices.COMException) {}
+        return null;
     }
     internal static string LookupTitle(string title) {
         string clean=Regex.Replace((title??"").Trim(),@"(?:\s*[-–(]\s*(?:shortcut|اختصار)\)?|\s+\(\d+\))$","",RegexOptions.IgnoreCase);
@@ -92,100 +132,118 @@ internal static class GameArtwork {
             default: return clean;
         }
     }
-    static string SearchSteam(string title) {
-        object items;
-        var result=Json("https://store.steampowered.com/api/storesearch/?l=english&cc=US&term="+Uri.EscapeDataString(title));
-        if(!result.TryGetValue("items",out items) || !(items is System.Collections.IEnumerable)) return null;
-        foreach(var row in ((System.Collections.IEnumerable)items).Cast<object>().OfType<Dictionary<string,object>>()) {
-            if(Normalize(Value(row,"name"))!=Normalize(title)) continue;
-            string id=Value(row,"id");
-            if(!Regex.IsMatch(id,@"^\d{1,10}$")) continue;
+    internal static string MatchSteamIcon(string json,string title,string expectedId) {
+        var rows=new JavaScriptSerializer().Deserialize<List<Dictionary<string,object>>>(json);
+        string match=null;
+        foreach(var row in rows ?? new List<Dictionary<string,object>>()) {
+            string id=Value(row,"appid");
+            if(!Regex.IsMatch(id,@"^\d{1,10}$") || (expectedId!=null ? expectedId!=id : Normalize(Value(row,"name"))!=Normalize(title))) continue;
             Uri uri;
-            if(Uri.TryCreate(Value(row,"tiny_image"),UriKind.Absolute,out uri) && uri.Scheme=="https" &&
-                (uri.Host.EndsWith(".steamstatic.com",StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".steamusercontent.com",StringComparison.OrdinalIgnoreCase)) &&
-                uri.AbsolutePath.Contains("/apps/"+id+"/")) return uri.AbsoluteUri;
-            return SteamCover(id);
+            if(!Uri.TryCreate(Value(row,"icon"),UriKind.Absolute,out uri) || uri.Scheme!="https" ||
+               !(uri.Host.EndsWith(".steamstatic.com",StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".akamaihd.net",StringComparison.OrdinalIgnoreCase) && uri.Host.StartsWith("steamcdn-",StringComparison.OrdinalIgnoreCase)) ||
+               !Regex.IsMatch(uri.AbsolutePath,@"^/(?:community_assets/images|steamcommunity/public/images)/apps/"+id+@"/[a-fA-F0-9]{40}\.(?:jpg|png|ico)$")) continue;
+            if(match!=null && match!=uri.AbsoluteUri) return null;
+            match=uri.AbsoluteUri;
         }
-        return null;
+        return match;
     }
-    static string SteamCover(string id) {
-        return "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/"+id+"/capsule_184x69.jpg";
+    static string SearchSteam(string title,string expectedId) {
+        string result=SearchIconByName(title,expectedId);
+        if(result!=null || expectedId==null || !Regex.IsMatch(expectedId,@"^\d{1,10}$")) return result;
+        // A manually renamed Steam shortcut still identifies its game by app ID.
+        var metadata=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(Encoding.UTF8.GetString(
+            Fetch("https://store.steampowered.com/api/appdetails?appids="+expectedId+"&filters=basic",262144)));
+        object record,data;
+        if(metadata==null || !metadata.TryGetValue(expectedId,out record)) return null;
+        var app=record as Dictionary<string,object>;
+        if(app==null || !app.TryGetValue("data",out data)) return null;
+        string official=Value(data as Dictionary<string,object>,"name");
+        return official.Length>0 && official.Length<=180 && !String.Equals(official,title,StringComparison.OrdinalIgnoreCase)
+            ? SearchIconByName(official,expectedId) : null;
     }
-    static BitmapSource SteamLocal(string id) {
-        if(id==null || !Regex.IsMatch(id,@"^\d{1,10}$")) return null;
-        string root=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),"Steam");
-        try { root=Microsoft.Win32.Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam","SteamPath",null) as string ?? root; }
-        catch(System.Security.SecurityException) {} catch(UnauthorizedAccessException) {}
-        string cache=Path.Combine(root,@"appcache\librarycache");
-        foreach(string path in new[]{Path.Combine(cache,id,"library_600x900.jpg"),Path.Combine(cache,id,"header.jpg"),Path.Combine(cache,id+"_library_600x900.jpg")}) {
-            var file=new FileInfo(path);
-            if(!file.Exists || file.Length>2048000) continue;
-            try {return Decode(File.ReadAllBytes(path));} catch(Exception) {}
-        }
-        return null;
+    static string SearchIconByName(string title,string expectedId) {
+        byte[] json=Fetch("https://steamcommunity.com/actions/SearchApps/"+Uri.EscapeDataString(title),196608);
+        return MatchSteamIcon(Encoding.UTF8.GetString(json),title,expectedId);
     }
-    static string Wiki(string title) {
-        foreach(string page in new[]{title+" (video game)",title}) {
-            Dictionary<string,object> row;
-            try {row=Json("https://en.wikipedia.org/api/rest_v1/page/summary/"+Uri.EscapeDataString(page.Replace(' ','_')));}
-            catch(WebException e) {var r=e.Response as HttpWebResponse;if(r==null || r.StatusCode!=HttpStatusCode.NotFound) throw; r.Dispose();continue;}
-            object thumbnail; Uri uri;
-            if(Normalize(Value(row,"title"))!=Normalize(page) || !Regex.IsMatch(Value(row,"description")+" "+Value(row,"extract"),@"\b(?:video game|multiplayer online battle arena|tactical shooter|sandbox game|strategy game|auto battler)\b",RegexOptions.IgnoreCase)) continue;
-            if(row.TryGetValue("thumbnail",out thumbnail) && Uri.TryCreate(Value(thumbnail as Dictionary<string,object>,"source"),UriKind.Absolute,out uri)
-                && uri.Scheme=="https" && uri.Host=="upload.wikimedia.org") return uri.AbsoluteUri;
-        }
-        return null;
-    }
-    // Match the Mac App Store edition only when the catalogue identifies the exact title as a game.
-    static string MacArtwork(string title) {
+    static string MacGameIcon(string title) {
+        var url="https://itunes.apple.com/search?country=us&entity=macSoftware&limit=8&term="+Uri.EscapeDataString(title);
+        var doc=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(Encoding.UTF8.GetString(Fetch(url,196608)));
         object results;
-        var row=Json("https://itunes.apple.com/search?country=us&entity=macSoftware&limit=8&term="+Uri.EscapeDataString(title));
-        if(row==null || !row.TryGetValue("results",out results) || !(results is System.Collections.IList)) return null;
-        foreach(var app in ((System.Collections.IList)results).OfType<Dictionary<string,object>>()) {
-            Uri uri;
-            if(Value(app,"primaryGenreName")=="Games" && Normalize(Value(app,"trackName"))==Normalize(title) &&
-               Uri.TryCreate(Value(app,"artworkUrl100"),UriKind.Absolute,out uri) && uri.Scheme=="https" &&
-               uri.Host.EndsWith(".mzstatic.com",StringComparison.OrdinalIgnoreCase)) return uri.AbsoluteUri;
+        if(doc==null || !doc.TryGetValue("results",out results) || !(results is System.Collections.IList)) return null;
+        string match=null;
+        foreach(var row in ((System.Collections.IList)results).OfType<Dictionary<string,object>>()) {
+            Uri icon;
+            if(Value(row,"primaryGenreName")!="Games" || Normalize(Value(row,"trackName"))!=Normalize(title) ||
+               !Uri.TryCreate(Value(row,"artworkUrl100"),UriKind.Absolute,out icon) || icon.Scheme!="https" ||
+               !icon.Host.EndsWith(".mzstatic.com",StringComparison.OrdinalIgnoreCase)) continue;
+            if(match!=null && match!=icon.AbsoluteUri) return null;
+            match=icon.AbsoluteUri;
+        }
+        return match;
+    }
+    static bool WaitBeforeRetry(string marker) {
+        if(!File.Exists(marker)) return false;
+        DateTime written=File.GetLastWriteTimeUtc(marker);
+        bool temporary=File.ReadAllText(marker)=="offline";
+        if(temporary && written.Ticks<Interlocked.Read(ref reconnectedAt)) return false;
+        return written > DateTime.UtcNow.AddMinutes(temporary ? -15 : -720);
+    }
+    internal static BitmapSource MinecraftIcon(string path) {
+        using(var stream=File.OpenRead(path))
+        using(var jar=new System.IO.Compression.ZipArchive(stream,System.IO.Compression.ZipArchiveMode.Read)) {
+            foreach(string name in new[]{"assets/minecraft/icons/release/icon_32x32.png","assets/minecraft/icons/icon_32x32.png","icons/icon_32x32.png"}) {
+                var entry=jar.GetEntry(name);
+                if(entry==null || entry.Length<1 || entry.Length>131072) continue;
+                using(var reader=new BinaryReader(entry.Open())) return Decode(reader.ReadBytes((int)entry.Length));
+            }
         }
         return null;
     }
-    static BitmapSource ReadOrFetch(string key,string title,string steamId,bool retry) {
-        Directory.CreateDirectory(folder);
+    // Mojang Java Edition asset index 5, icons/icon_32x32.png (content-addressed).
+    internal const string MinecraftWindowIcon="af96f55a90eaf11b327f1b5f8834a051027dc506";
+    internal static BitmapSource ReadOrFetch(string key,string title,string steamId,bool retry,string minecraftJar,bool online,string cacheRoot=null) {
+        cacheRoot=cacheRoot??folder;
+        Directory.CreateDirectory(cacheRoot);
         string hash;
         using(var sha=SHA256.Create()) hash=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key))).Replace("-","");
-        string path=Path.Combine(folder,hash+".png"), miss=path+".retry";
-        if(File.Exists(path)) {
+        string path=Path.Combine(cacheRoot,hash+".png"), miss=path+".retry";
+        if(!retry && File.Exists(path)) {
             try {return Decode(File.ReadAllBytes(path));} catch(Exception) {File.Delete(path);}
         }
-        if(!retry && File.Exists(miss) && File.GetLastWriteTimeUtc(miss)>DateTime.UtcNow.AddHours(-12)) return null;
-        string tmp=Path.Combine(folder,Guid.NewGuid().ToString("N")+".tmp");
+        string tmp=Path.Combine(cacheRoot,Guid.NewGuid().ToString("N")+".tmp");
         try {
-            BitmapSource image=SteamLocal(steamId);
+            BitmapSource image=null;
             bool unavailable=false;
-            foreach(var provider in new Func<string>[] {
-                ()=>steamId==null ? SearchSteam(title) : SteamCover(steamId),
-                ()=>Wiki(title), ()=>MacArtwork(title)
-            }) {
-                if(image!=null) break;
+            if(minecraftJar!=null) {
+                try {image=MinecraftIcon(minecraftJar);} catch(IOException) {} catch(InvalidDataException) {}
+            }
+            if(image==null && (!online || (!retry && WaitBeforeRetry(miss)))) return null;
+            if(image==null) {
                 try {
-                    string uri=provider();
+                    string uri=steamId==null && Normalize(title)=="minecraft"
+                        ? "https://resources.download.minecraft.net/af/"+MinecraftWindowIcon : SearchSteam(title,steamId);
                     if(uri!=null) image=Decode(Fetch(uri,512000));
                 } catch(WebException e) {unavailable=true;if(e.Response!=null)e.Response.Dispose();}
-                  catch(Exception) {unavailable=true;}
+            }
+            if(image==null && steamId==null && Normalize(title)!="minecraft") {
+                try {
+                    string uri=MacGameIcon(title);
+                    if(uri!=null) image=Decode(Fetch(uri,512000));
+                } catch(WebException e) {unavailable=true;if(e.Response!=null)e.Response.Dispose();}
             }
             if(image==null) {
-                File.WriteAllText(miss,"");
-                if(unavailable) File.SetLastWriteTimeUtc(miss,DateTime.UtcNow.AddHours(-12).AddMinutes(15));
+                File.WriteAllText(miss,unavailable ? "offline" : "missing");
                 return null;
             }
             try {
                 var encoder=new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
-            using(var stream=File.Create(tmp)) encoder.Save(stream);
-                if(!File.Exists(path)) File.Move(tmp,path);
+                using(var stream=File.Create(tmp)) encoder.Save(stream);
+                if(retry && File.Exists(path)) File.Replace(tmp,path,null);
+                else if(!File.Exists(path)) File.Move(tmp,path);
             } catch(IOException) {} catch(UnauthorizedAccessException) {}
             return image;
         } catch(Exception) {
-            File.WriteAllText(miss,""); File.SetLastWriteTimeUtc(miss,DateTime.UtcNow.AddHours(-12).AddMinutes(15)); return null;
+            File.WriteAllText(miss,"offline"); return null;
         } finally { if(File.Exists(tmp)) File.Delete(tmp); }
     }
 }

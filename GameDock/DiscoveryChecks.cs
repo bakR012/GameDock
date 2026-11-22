@@ -55,6 +55,10 @@ internal static class DiscoveryChecks {
         Write(Path.Combine(home,@"libraries\com\mojang\minecraft\1.0\minecraft-1.0-client.jar"));
         scan.Prism(exe,home); scan.Consolidate();
         Check(scan.Games.Count==1 && scan.Games.Values.Single().Arguments.EndsWith("\"pack2\""),"one Minecraft tile launching an installed profile");
+        var game=scan.Games["prism-minecraft"];
+        Check(game.LaunchArguments(false)=="--dir \""+home+"\"" && game.LaunchArguments(true)==game.Arguments,
+            "Minecraft picker and last played profile use the same installation");
+        Check(new InstalledGame {Arguments="--play"}.LaunchArguments(false)=="--play","Minecraft preference leaves other games alone");
     }
     static void ExternalGames() {
         var library=Path.Combine(root,"gog");
@@ -121,9 +125,76 @@ internal static class DiscoveryChecks {
         File.Delete(exe);scan=new GameScan();scan.Steam(lib);
         Check(scan.Games.Count==0,"stale Steam manifest and empty game directory");
     }
-    static int Main() {
+    static void MakeLink(dynamic shell,string path,string target,string args,string icon) {
+        dynamic link=shell.CreateShortcut(path);
+        try {link.TargetPath=target;link.Arguments=args;link.IconLocation=icon+",0";link.Save();}
+        finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(link);}
+    }
+    static byte[] Picture(int width,int height) {
+        using(var image=new System.Drawing.Bitmap(width,height))
+        using(var memory=new MemoryStream()) {
+            image.Save(memory,System.Drawing.Imaging.ImageFormat.Png);
+            return memory.ToArray();
+        }
+    }
+    static void Icons() {
+        var provider=Write(@"provider\Runner.exe");
+        var shared=Write(@"provider\Badge.ico");
+        var prism=Write(@"provider\prismlauncher.exe");
+        object shell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
         try {
-            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam();
+            foreach(string title in new[]{"LANESPLIT","A Plague Tale Requiem"}) {
+                string link=Path.Combine(root,title+".lnk");
+                MakeLink(shell,link,provider,"--game 1",shared);
+                var game=ManualGame.Read(link,shell);
+                Check(!game.LauncherOnly && game.Icon==null && game.Title==title,"ignore shared launcher badge for "+title);
+            }
+            var linkPath=Path.Combine(root,"Prism Launcher.lnk");
+            MakeLink(shell,linkPath,prism,"",prism);
+            Check(ManualGame.Read(linkPath,shell).LauncherOnly,"standalone Prism shortcut hidden in manual mode");
+            MakeLink(shell,linkPath,prism,"--launch pack",prism);
+            var profile=ManualGame.Read(linkPath,shell);
+            Check(!profile.LauncherOnly && profile.Title=="Minecraft" && profile.Icon==null,"Prism game shortcut keeps its launch action and game identity");
+            var url=Write("Custom.url","[InternetShortcut]\r\nURL=steam://rungameid/3278310\r\nIconFile="+shared);
+            var steam=ManualGame.Read(url,shell);
+            Check(steam.SteamId=="3278310" && steam.Icon==null,"URL ignores shared launcher icon");
+        } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell);}
+        const string icon="https://shared.fastly.steamstatic.com/community_assets/images/apps/1182900/eaebd6a8952539659e28725f90802cd1a4f93d37.jpg";
+        const string cover="https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/1182900/capsule_184x69.jpg";
+        string rows=json.Serialize(new[]{new {appid="752590",name="A Plague Tale: Innocence",icon="",logo=cover},new {appid="1182900",name="A Plague Tale: Requiem",icon=icon,logo=cover}});
+        Check(GameArtwork.MatchSteamIcon(rows,"A Plague Tale Requiem",null)==icon,"select exact edition and Steam icon field");
+        Check(GameArtwork.MatchSteamIcon(rows.Replace(icon,cover),"A Plague Tale Requiem",null)==null,"reject store cover even in the icon field");
+        Check(GameArtwork.MatchSteamIcon(rows,"A Plague Tale Requiem","3278310")==null,"ignore icon from different Steam app");
+        try {GameArtwork.Decode(Picture(184,69));throw new Exception("accepted rectangular artwork");}
+        catch(InvalidDataException) {Check(true,"reject rectangular images before scaling");}
+        Check(GameArtwork.Decode(Picture(32,32)).PixelWidth==32,"keep original square icon dimensions");
+        string archive=Write("client.jar");
+        using(var zip=new System.IO.Compression.ZipArchive(File.Create(archive),System.IO.Compression.ZipArchiveMode.Create))
+        using(var entry=zip.CreateEntry("assets/minecraft/icons/release/icon_32x32.png").Open()) {
+            var bytes=Picture(32,32);entry.Write(bytes,0,bytes.Length);
+        }
+        Check(GameArtwork.MinecraftIcon(archive).PixelWidth==32,"read the game icon from the Minecraft client");
+        var cache=Path.Combine(root,"cache");
+        Check(GameArtwork.ReadOrFetch("mc","Minecraft",null,false,archive,false,cache).PixelWidth==32,"offline local icon lookup");
+        using(var zip=new System.IO.Compression.ZipArchive(File.Create(archive),System.IO.Compression.ZipArchiveMode.Create))
+        using(var entry=zip.CreateEntry("icons/icon_32x32.png").Open()) {
+            var replacement=Picture(48,48);entry.Write(replacement,0,replacement.Length);
+        }
+        Check(GameArtwork.ReadOrFetch("mc","Minecraft",null,true,archive,false,cache).PixelWidth==48 &&
+            GameArtwork.ReadOrFetch("mc","Minecraft",null,false,null,false,cache).PixelWidth==48,"repair replaces cached icon and survives offline restart");
+        Check(GameArtwork.ReadIconFile(Write("bad.ico","broken"))==null,"broken Windows icon falls through to automatic lookup");
+    }
+    [STAThread]
+    static int Main(string[] args) {
+        try {
+            if(args.Contains("--online-icons")) {
+                foreach(string title in new[]{"Bloons TD 6","A Plague Tale Requiem","LANESPLIT","Minecraft"}) {
+                    var icon=GameArtwork.Get(title,null,true).GetAwaiter().GetResult();
+                    Check(icon!=null && icon.PixelWidth==icon.PixelHeight,"live publisher icon for "+title);
+                }
+                return 0;
+            }
+            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons();
             Check(GameArtwork.LookupTitle("TeamfightTactics")=="Teamfight Tactics" &&
                 GameArtwork.Normalize("Sky Walk™ 2")==GameArtwork.Normalize("SkyWalk2"),"artwork title matching");
             return 0;
