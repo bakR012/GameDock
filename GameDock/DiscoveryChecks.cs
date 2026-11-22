@@ -214,6 +214,43 @@ internal static class DiscoveryChecks {
             GameArtwork.ReadOrFetch("mc","Minecraft",null,false,null,false,cache).PixelWidth==48,"repair replaces cached icon and survives offline restart");
         Check(GameArtwork.ReadIconFile(Write("bad.ico","broken"))==null,"broken Windows icon falls through to automatic lookup");
     }
+    static void PersonalPins() {
+        string storage=Path.Combine(root,"pin-store");
+        var pins=new DockPins(storage);
+        var first=Write(@"personal\a\editor.exe");
+        var second=Write(@"personal\b\editor.exe");
+        var note=Write(@"personal\notes.txt","keep me");
+        var folder=Path.GetDirectoryName(note);
+        string app=pins.Add(first), other=pins.Add(second), doc=pins.Add(note), dir=pins.Add(folder);
+        Check(app==pins.Add(first) && other==pins.Add(second) && app!=other,"repeated app pins reuse shortcuts and same-name apps stay distinct");
+        var url=Write(@"personal\Play.url","[InternetShortcut]\r\nURL=steam://rungameid/314");
+        var play=pins.Add(url);
+        Check(File.Exists(url) && File.ReadAllText(pins.FileFor(play))==File.ReadAllText(url),"pinning a shortcut copies it and preserves the original");
+        File.Delete(url);
+        string launcherPath=Write(@"personal\prismlauncher.exe");
+        string launcher=pins.Add(launcherPath);
+        var empty=new string[0];
+        string[] order={launcher,doc,play,dir,other,app};
+        pins=new DockPins(storage);
+        Check(pins.Entries(new GameScan(),order,empty).SequenceEqual(order),"apps, launchers, documents, folders and copied URLs survive a cold start before detection");
+        var scan=new GameScan();
+        scan.Games["steam-314"]=new InstalledGame {Title="Game",Target="steam://rungameid/314"};
+        scan.Games["other-game"]=new InstalledGame {Title="Another game",Proof=Write(@"fixture\game.exe")};
+        Check(pins.Entries(scan,new[]{"steam-314","other-game"}.Concat(order).ToArray(),empty).SequenceEqual(new[]{"other-game"}.Concat(order)),
+            "matching detected game does not duplicate or displace an explicitly positioned pin");
+        Check(!pins.Entries(scan,order,new[]{play}).Any(id=>id==play || id=="steam-314") &&
+            pins.Entries(scan,order,empty).Contains(play),"removal survives rescan and restoration returns the pinned game");
+        Check(File.Exists(first) && File.Exists(second) && File.ReadAllText(note)=="keep me" && Directory.Exists(folder),
+            "pinning and hiding do not modify original files or directories");
+        object shell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+        try {
+            var link=Path.Combine(folder,"Play profile.lnk");
+            MakeLink(shell,link,launcherPath,"--launch pack",null);
+            string profile=pins.Add(link);
+            var saved=ManualGame.Read(pins.FileFor(profile),shell);
+            Check(String.Equals(saved.Target,launcherPath,StringComparison.OrdinalIgnoreCase) && saved.Arguments=="--launch pack","pin preserves a launcher's exact profile arguments");
+        } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell);}
+    }
     [STAThread]
     static int Main(string[] args) {
         try {
@@ -224,7 +261,7 @@ internal static class DiscoveryChecks {
                 }
                 return 0;
             }
-            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons();
+            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons(); PersonalPins();
             Check(GameArtwork.LookupTitle("TeamfightTactics")=="Teamfight Tactics" &&
                 GameArtwork.Normalize("Sky Walk™ 2")==GameArtwork.Normalize("SkyWalk2"),"artwork title matching");
             return 0;

@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.7.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.8.0.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -291,6 +291,7 @@ class GameDock : Window {
     bool downloadIcons=Preference("AutoDownloadIcons",1,0,1)==1;
     bool lastMinecraftProfile=Preference("LastMinecraftProfile",0,0,1)==1;
     GameScan detected = new GameScan();
+    readonly DockPins pins=new DockPins(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"GameDock","Pinned"));
     readonly Dictionary<string,FileSystemWatcher> gameWatchers = new Dictionary<string,FileSystemWatcher>(StringComparer.OrdinalIgnoreCase);
     bool scanning, rescan;
     int retryCount;
@@ -328,6 +329,7 @@ class GameDock : Window {
                     detected=result;
                     var list=Entries();
                     if(!entries.SequenceEqual(list,Paths) || list.Any(id=>{
+                        if(DockPins.IsPin(id)) return false;
                         InstalledGame before;
                         var after=result.Games[id];
                         return !previous.Games.TryGetValue(id,out before) || before.Title!=after.Title ||
@@ -350,12 +352,8 @@ class GameDock : Window {
     string[] Entries() {
         manualGames.Clear();
         if (host.automatic) {
-            var ids = host.detected.Games.OrderBy(pair=>pair.Value.Title,StringComparer.CurrentCultureIgnoreCase).Select(pair=>pair.Key).ToArray();
             var order = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
-            var hidden=new HashSet<string>(HiddenNames().Select(host.detected.Resolve),Paths);
-            var ranked=order.Select(host.detected.Resolve).Intersect(ids,Paths);
-            return ranked.Concat(ids.Except(ranked,Paths)).Where(id=>!hidden.Contains(id) &&
-                !hidden.Contains("title:"+GameArtwork.Normalize(host.detected.Games[id].Title))).ToArray();
+            return host.pins.Entries(host.detected,order,HiddenNames());
         }
         var items = new DirectoryInfo(folder).GetFileSystemInfos().AsEnumerable();
         if (!SameFolder(folder,DockStorage) && Directory.Exists(DockStorage))
@@ -402,6 +400,7 @@ class GameDock : Window {
                 link.TargetPath = pick.FileName;
                 link.Save();
             });
+            if(host.automatic) host.pins.Invalidate();
             Refresh();
         } catch (Exception e) { Alert(T("تعذّر إصلاح الاختصار.","Could not repair the shortcut.") + "\n" + e.Message); }
     }
@@ -452,11 +451,13 @@ class GameDock : Window {
         }
         return PlaceEntry(source,folder,false);
     }
-    static string PlaceEntry(string source,string destination,bool reuse,bool moveShortcut = false) {
+    internal static string PlaceEntry(string source,string destination,bool reuse,bool moveShortcut = false) {
         if (SameFolder(Path.GetDirectoryName(source),destination)) return Path.GetFileName(source);
         bool copy = File.Exists(source) && (Link(source) || Url(source));
         if (!File.Exists(source) && !Directory.Exists(source)) throw new FileNotFoundException(source);
-        string name = copy ? Path.GetFileName(source) : Path.GetFileName(source) + ".lnk";
+        string leaf=Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar));
+        if(String.IsNullOrEmpty(leaf) || leaf.EndsWith(":")) leaf=String.IsNullOrEmpty(leaf) ? "Drive" : "Drive "+leaf.TrimEnd(':');
+        string name = copy ? Path.GetFileName(source) : leaf + ".lnk";
         string candidate = Path.Combine(destination,name);
         for (int i = 2; File.Exists(candidate) || Directory.Exists(candidate); i++) {
             if (reuse && copy && SameShortcut(source,candidate)) {
@@ -466,8 +467,9 @@ class GameDock : Window {
             }
             if (reuse && !copy && File.Exists(candidate)) {
                 string target = "";
-                WithLink(candidate,delegate(dynamic link) { target = link.TargetPath; });
-                if (Paths.Equals(target,source)) return Path.GetFileName(candidate);
+                bool plain=false;
+                WithLink(candidate,delegate(dynamic link) { target = link.TargetPath; plain=String.IsNullOrEmpty((string)link.Arguments); });
+                if (plain && Paths.Equals(target,source)) return Path.GetFileName(candidate);
             }
             candidate = Path.Combine(destination,Path.GetFileNameWithoutExtension(name) + " (" + i + ")" + Path.GetExtension(name));
         }
@@ -475,7 +477,7 @@ class GameDock : Window {
         else if (copy) File.Copy(source,candidate);
         else WithLink(candidate,delegate(dynamic link) {
             link.TargetPath = source;
-            link.WorkingDirectory = Path.GetDirectoryName(source);
+            link.WorkingDirectory = Path.GetDirectoryName(source) ?? source;
             link.Save();
         });
         return Path.GetFileName(candidate);
@@ -549,15 +551,17 @@ class GameDock : Window {
     }
     void OpenItemMenu(Button tile,string path) {
         var menu = new ContextMenu { FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft };
-        if (!host.automatic && (Link(path) || Url(path))) {
+        bool pin=host.automatic && DockPins.IsPin(path);
+        string shortcut=pin ? host.pins.FileFor(path) : path;
+        if ((!host.automatic || pin) && (Link(shortcut) || Url(shortcut))) {
             var item = new MenuItem { Header = T("إصلاح الاختصار…","Repair shortcut…") };
-            item.Click += delegate { Repair(path); };
+            item.Click += delegate { Repair(shortcut); };
             menu.Items.Add(item);
         }
-        if(host.automatic || Link(path) || Url(path) || Paths.Equals(Path.GetExtension(path),".exe")) {
+        if(!pin && (host.automatic || Link(path) || Url(path) || Paths.Equals(Path.GetExtension(path),".exe"))) {
             InstalledGame game;
-            ManualGame manual;
-            host.manualGames.TryGetValue(Path.GetFileName(path),out manual);
+            ManualGame manual=null;
+            if(!host.automatic) host.manualGames.TryGetValue(Path.GetFileName(path),out manual);
             host.detected.Games.TryGetValue(path,out game);
             string title=host.automatic && game!=null ? game.Title : manual!=null ? manual.Title : Path.GetFileNameWithoutExtension(path);
             string iconKey=GameArtwork.Normalize(title);
@@ -582,6 +586,10 @@ class GameDock : Window {
                 menu.Items.Add(restore);
             }
         }
+        if(host.automatic) {
+            var add=new MenuItem {Header=T("إضافة تطبيق أو ملف…","Add app or file…")};
+            add.Click+=delegate {PickItems();}; menu.Items.Add(add);
+        }
         var remove = new MenuItem { Header = T("إزالة من الشريط","Remove from dock") };
         remove.Click += delegate { RemoveEntry(path,false); };
         menu.Items.Add(remove); menu.PlacementTarget = tile; menu.IsOpen = true;
@@ -603,10 +611,11 @@ class GameDock : Window {
     int Gap(DragEventArgs e) {
         return Math.Max(0,Math.Min(entries.Length,(int)Math.Floor(Along(e.GetPosition(icons)) / Step + 0.5)));
     }
-    static DragDropEffects IncomingEffect(DragEventArgs e,bool local) {
+    DragDropEffects IncomingEffect(DragEventArgs e,bool local) {
         if (local) return e.AllowedEffects & DragDropEffects.Move;
         var files = e.Data.GetData(DataFormats.FileDrop) as string[];
         if (files == null || files.Length == 0) return DragDropEffects.None;
+        if(host.automatic) return (e.AllowedEffects & DragDropEffects.Copy)!=0 ? DragDropEffects.Copy : e.AllowedEffects & DragDropEffects.Link;
         // Never report an entire mixed batch as moved: regular files remain in place.
         if (files.All(DesktopShortcut)) return e.AllowedEffects & DragDropEffects.Move;
         if (files.Any(DesktopShortcut) && (e.AllowedEffects & DragDropEffects.Move) == 0) return DragDropEffects.None;
@@ -614,7 +623,7 @@ class GameDock : Window {
     }
     void Dragging(object sender, DragEventArgs e) {
         bool local = host.draggingDock != null && e.Data.GetDataPresent("GameDock.Item");
-        e.Effects = host.automatic && !local ? DragDropEffects.None : IncomingEffect(e,local);
+        e.Effects = IncomingEffect(e,local);
         if (e.Effects != DragDropEffects.None) {
             double x = Along(e.GetPosition(strip));
             if (x < 12 || x > (Side ? strip.ActualHeight : strip.ActualWidth) - 12)
@@ -628,28 +637,46 @@ class GameDock : Window {
         bool local = host.draggingDock != null && e.Data.GetDataPresent("GameDock.Item");
         var files = local ? new[] { e.Data.GetData("GameDock.Item") as string } : e.Data.GetData(DataFormats.FileDrop) as string[];
         e.Effects = DragDropEffects.None;
-        if (host.automatic && !local) return;
         var effect = IncomingEffect(e,local);
         if (files == null || effect == DragDropEffects.None) return;
+        if(ArrangeItems(files,local,Gap(e))) e.Effects=effect;
+    }
+    bool ArrangeItems(string[] files,bool local,int requestedGap) {
         try {
-            var order = Entries().ToList();
-            int gap = Math.Min(Gap(e),order.Count);
-            var added = new System.Collections.Generic.List<string>();
+            var order = host.Entries().ToList();
+            int gap = Math.Min(requestedGap,order.Count);
+            var added = new List<string>();
+            var errors = new List<string>();
             foreach (string file in files) {
-                if (local && !host.automatic && !File.Exists(file) && !Directory.Exists(file)) return;
-                string name = local ? (host.automatic ? file : Path.GetFileName(file)) : ImportEntry(file);
+                if(String.IsNullOrEmpty(file)) continue;
+                if (local && !host.automatic && !File.Exists(file) && !Directory.Exists(file)) continue;
+                string name;
+                try {name=local ? (host.automatic ? file : Path.GetFileName(file)) :
+                    host.automatic ? host.pins.Add(file) : ImportEntry(file);}
+                catch(Exception ex) {errors.Add(Path.GetFileName(file)+" — "+ex.Message); continue;}
                 int previous = order.FindIndex(n => Paths.Equals(n,name));
                 if (previous >= 0) { order.RemoveAt(previous); if (previous < gap) gap--; }
                 if (!added.Contains(name,Paths)) added.Add(name);
             }
             order.InsertRange(gap,added);
-            Registry.SetValue(OrderKey,OrderName,order.ToArray(),RegistryValueKind.MultiString);
+            var previousOrder=ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
+            Registry.SetValue(OrderKey,OrderName,host.automatic ? order.Concat(previousOrder.Except(order,Paths)).ToArray() : order.ToArray(),RegistryValueKind.MultiString);
             var hidden = HiddenNames();
             if (hidden.Length > 0)
                 Registry.SetValue(HiddenKey,OrderName,hidden.Except(added,Paths).ToArray(),RegistryValueKind.MultiString);
-            e.Effects = effect;
-        } catch (Exception ex) { Alert(T("تعذّر إكمال الإفلات.","Could not complete the drop.") + "\n" + ex.Message); }
-        Refresh();
+            if(errors.Count>0) Alert(String.Join("\n",errors));
+            return added.Count>0;
+        } catch (Exception ex) { Alert(ex.Message); return false; }
+        finally { Refresh(); }
+    }
+    void PickItems() {
+        var picker=new OpenFileDialog {Title=T("إضافة تطبيقات أو اختصارات أو ملفات","Add apps, shortcuts or files"),
+            Multiselect=true,DereferenceLinks=false,CheckFileExists=true};
+        if(picker.ShowDialog(host.settingsWindow ?? this)==true && ArrangeItems(picker.FileNames,false,Int32.MaxValue)) {
+            var dock=host.settingsWindow!=null ? host.settingsAnchor : this;
+            dock.UpdateLayout();
+            dock.ScrollTo(dock.entries.Length*(double)dock.Step);
+        }
     }
     static readonly Dictionary<string,int> genericIcons=new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
     static bool GenericIcon(string extension,int index) {
@@ -931,7 +958,7 @@ class GameDock : Window {
 
         var layout=new DockPanel {Margin=new Thickness(14,10,14,12)};
         var nav=new UniformGrid {Rows=1,Margin=new Thickness(0,0,0,8)};
-        string[] pages={T("الألعاب","Games"),T("الشريط","Dock"),T("المظهر","Appearance"),T("عام","General")};
+        string[] pages={T("المكتبة","Library"),T("الشريط","Dock"),T("المظهر","Appearance"),T("عام","General")};
         for(int i=0;i<pages.Length;i++) {
             int page=i;
             var tab=SettingButton(pages[i],delegate {settingsPage=page;DrawSettings();},page==settingsPage);
@@ -1009,7 +1036,12 @@ class GameDock : Window {
             });
         files.Children.Add(SettingButton(T("فتح المجلد","Open folder"), delegate { Launch(folder); }, false));
         files.Children.Add(SettingButton(T("تغيير المجلد","Change folder"), Choose, false));
-        if (automatic) body.Children.Add(SettingButton(T("تحديث قائمة الألعاب","Refresh detected games"),ScanGames,false));
+        if (automatic) {
+            var actions=new WrapPanel();
+            actions.Children.Add(SettingButton(T("إضافة تطبيق أو ملف…","Add app or file…"),PickItems,false));
+            actions.Children.Add(SettingButton(T("تحديث قائمة الألعاب","Refresh detected games"),ScanGames,false));
+            body.Children.Add(actions);
+        }
         else body.Children.Add(files);
         if ((automatic || Directory.Exists(folder)) && HiddenNames().Length > 0)
             body.Children.Add(SettingButton(T("إظهار العناصر المخفية","Restore hidden items"),delegate {
@@ -1201,7 +1233,8 @@ class GameDock : Window {
     }
     Button EntryTile(int index) {
         string entry = entries[index];
-        if (host.automatic) {
+        bool pin=host.automatic && DockPins.IsPin(entry);
+        if (host.automatic && !pin) {
             InstalledGame game;
             if (!host.detected.Games.TryGetValue(entry,out game)) return new Button();
             string verifiedExe=(entry.StartsWith("riot-") || entry.StartsWith("gog-") || entry.StartsWith("xbox-") ||
@@ -1216,10 +1249,10 @@ class GameDock : Window {
             Canvas.SetTop(button,Side ? index*(double)TileHeight : 0);
             return button;
         }
-        string path = InFolder(entry);
-        ManualGame manual;
-        bool isGame=host.manualGames.TryGetValue(entry,out manual);
-        string title=isGame ? manual.Title : entry;
+        string path = pin ? host.pins.FileFor(entry) : InFolder(entry);
+        ManualGame manual=null;
+        bool isGame=!pin && host.manualGames.TryGetValue(entry,out manual);
+        string title=pin ? Path.GetFileNameWithoutExtension(path) : isGame ? manual.Title : entry;
         object visual;
         if(isGame) visual=GameVisual(title,manual.Icon,manual.SteamId,null,null,manual.TargetIcon);
         else {
@@ -1227,7 +1260,7 @@ class GameDock : Window {
             visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};
         }
         var tile=Tile(visual,title,delegate {OpenEntry(path);},true);
-        EnableDrag(tile,path);
+        EnableDrag(tile,pin ? entry : path);
         Canvas.SetLeft(tile,Side ? 0 : index*(double)Slot);
         Canvas.SetTop(tile,Side ? index*(double)TileHeight : 0);
         return tile;
@@ -1267,7 +1300,7 @@ class GameDock : Window {
         icons.Width = Side ? Slot : Slot*(double)count;
         icons.Height = Side ? TileHeight*(double)count : TileHeight;
         if (entries.Length != 0) ShowVisibleTiles();
-        else if (host.automatic) icons.Children.Add(Tile("🎮", T("لم يُعثر على ألعاب مدعومة. اضغط للتحديث","No supported games found. Click to refresh"),host.ScanGames));
+        else if (host.automatic) icons.Children.Add(Tile("+",T("أضف تطبيقًا أو اسحبه إلى الشريط","Add an app or drag it onto the dock"),PickItems));
         else if (failed) icons.Children.Add(Tile("…", T("تعذّرت قراءة المجلد. اختر مجلداً آخر", "Folder unavailable. Choose another folder"), Choose));
         else {
             var add = Tile("+", T("افتح المجلد وأضف اختصاراتك", "Open folder to add shortcuts"), delegate { Launch(folder); });

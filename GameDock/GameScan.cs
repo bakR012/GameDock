@@ -16,7 +16,7 @@ internal sealed class InstalledGame {
 }
 
 internal sealed class ManualGame {
-    internal string Title, Icon, TargetIcon, SteamId;
+    internal string Title, Icon, TargetIcon, SteamId, Target, Arguments;
     internal bool LauncherOnly;
 
     internal static ManualGame Read(string path,object shortcutShell) {
@@ -42,6 +42,8 @@ internal sealed class ManualGame {
                 var steam=Regex.Match(target,@"^steam://(?:run|rungameid)/(\d+)/?$",RegexOptions.IgnoreCase);
                 if(steam.Success) game.SteamId=steam.Groups[1].Value;
             }
+            game.Target=target;
+            game.Arguments=args;
             bool prism=GameScan.IsPrism(target);
             bool profile=prism && Regex.IsMatch(args,@"(?:^|\s)(?:--launch|-l)\s+(?:""[^""]+""|[^\s""]+)",RegexOptions.IgnoreCase);
             if(profile && GameScan.IsPrism(title)) game.Title="Minecraft";
