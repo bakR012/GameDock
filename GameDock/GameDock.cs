@@ -18,18 +18,31 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.5.0.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
     static extern int SetWindowLong(IntPtr window, int index, int value);
 
-    static void ExcludeFromSwitcher(Window window) {
+        [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ITaskbarList {
+        void HrInit(); void AddTab(IntPtr hwnd); void DeleteTab(IntPtr hwnd);
+    }
+    bool showInSwitcher = Preference("ShowInSwitcher",0,0,1)==1;
+    static void SetSwitcher(Window window,bool visible) {
         const int extendedStyle = -20, toolWindow = 0x80, appWindow = 0x40000;
         var hwnd = new WindowInteropHelper(window).Handle;
         int style = GetWindowLong(hwnd, extendedStyle);
-        SetWindowLong(hwnd, extendedStyle, (style | toolWindow) & ~appWindow);
+                SetWindowLong(hwnd, extendedStyle, visible ? (style | appWindow) & ~toolWindow : (style | toolWindow) & ~appWindow);
+        if (visible) window.Dispatcher.BeginInvoke(new Action(delegate {
+            if (!window.IsVisible) return;
+            ITaskbarList list=null;
+            try {
+                list=(ITaskbarList)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("56FDF344-FD6D-11d0-958A-006097C9A090")));
+                list.HrInit(); list.DeleteTab(hwnd);
+            } catch(COMException) {} finally {if(list!=null) Marshal.ReleaseComObject(list);}
+        }),DispatcherPriority.ApplicationIdle);
     }
     readonly GameDock host;
     readonly List<GameDock> mirrors = new List<GameDock>();
@@ -578,11 +591,23 @@ class GameDock : Window {
         } catch (Exception ex) { Alert(T("تعذّر إكمال الإفلات.","Could not complete the drop.") + "\n" + ex.Message); }
         Refresh();
     }
-    static BitmapSource GetIcon(string path) {
+    static readonly Dictionary<string,int> genericIcons=new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
+    static bool GenericIcon(string extension,int index) {
+        int generic;
+        if(!genericIcons.TryGetValue(extension,out generic)) {
+            FileIcon info;
+            if(SHGetFileInfo("GameDockIconProbe"+extension,128,out info,(uint)Marshal.SizeOf(typeof(FileIcon)),0x4010)==IntPtr.Zero) return false;
+            genericIcons[extension]=generic=info.index;
+        }
+        return generic==index;
+    }
+    static BitmapSource GetIcon(string path,bool checkGeneric=false) {
         FileIcon info;
         // Use the base system image, with no shortcut overlay mask.
         IntPtr list = SHGetFileInfo(path, 0, out info, (uint)Marshal.SizeOf(typeof(FileIcon)), 0x4000);
         if (list == IntPtr.Zero) return null;
+        if(checkGeneric && (GenericIcon(Path.GetExtension(path),info.index) || GenericIcon(".exe",info.index) ||
+            GenericIcon(".lnk",info.index) || GenericIcon(".url",info.index) || GenericIcon(".gamedockunknown",info.index))) return null;
         info.handle = ImageList_GetIcon(list, info.index, 0);
         if (info.handle == IntPtr.Zero) return null;
         try {
@@ -817,6 +842,28 @@ class GameDock : Window {
         w.FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft;
         var body = new StackPanel { Margin = new Thickness(16,4,16,14) };
         AddDisplaySetting(body);
+        var switchRow=new DockPanel {Margin=new Thickness(2,10,2,3)};
+        var label=T("إظهار الشريط في Alt+Tab","Show dock in Alt+Tab");
+        var knob=new Border {Width=14,Height=14,CornerRadius=new CornerRadius(7),Margin=new Thickness(3),Background=Brushes.White};
+        var track=new Border {Width=36,Height=20,CornerRadius=new CornerRadius(10),Child=knob};
+        var toggle=new ToggleButton {Content=track,IsChecked=showInSwitcher,VerticalAlignment=VerticalAlignment.Center,
+            Padding=new Thickness(0),BorderThickness=new Thickness(0),Cursor=Cursors.Hand,ToolTip=label};
+        var presenter=new FrameworkElementFactory(typeof(ContentPresenter));
+        toggle.Template=new ControlTemplate(typeof(ToggleButton)){VisualTree=presenter};
+        System.Windows.Automation.AutomationProperties.SetName(toggle,label);
+        Action paint=delegate {
+            knob.HorizontalAlignment=showInSwitcher ? HorizontalAlignment.Right : HorizontalAlignment.Left;
+            track.Background=showInSwitcher ? Color("#217B66") : Color("#737780");
+        };
+        paint();
+        toggle.Click+=delegate {
+            showInSwitcher=toggle.IsChecked==true;
+            SavePreference("ShowInSwitcher",showInSwitcher?1:0);
+            SetSwitcher(this,showInSwitcher); paint();
+        };
+        DockPanel.SetDock(toggle,Dock.Right); switchRow.Children.Add(toggle);
+        switchRow.Children.Add(new TextBlock {Text=label,VerticalAlignment=VerticalAlignment.Center});
+        body.Children.Add(switchRow);
         Section(body,T("مكان الشريط","Dock position"),
             new[] { T("يسار","Left"),T("فوق","Top"),T("يمين","Right"),T("تحت","Bottom") },(int)edge,
             delegate(int i) {
@@ -883,7 +930,7 @@ class GameDock : Window {
         w.SetResourceReference(Window.BackgroundProperty, "Panel");
         w.SetResourceReference(Window.ForegroundProperty, "Text");
         w.SizeChanged += delegate { PositionSettings(); };
-        w.SourceInitialized += delegate { ExcludeFromSwitcher(w); SyncColors(); };
+        w.SourceInitialized += delegate { SetSwitcher(w,false); SyncColors(); };
         w.Activated += delegate { SyncColors(); };
         SystemEvents.UserPreferenceChanged += WindowsPreferenceChanged;
         w.Closed += delegate { SystemEvents.UserPreferenceChanged -= WindowsPreferenceChanged;
@@ -894,7 +941,7 @@ class GameDock : Window {
         host = owner ?? this;
         screen = display ?? Forms.Screen.PrimaryScreen;
         settingsAnchor = this;
-        SourceInitialized += delegate { ExcludeFromSwitcher(this); };
+        SourceInitialized += delegate { SetSwitcher(this,host==this && showInSwitcher); };
         Title = "GameDock"; WindowStyle = WindowStyle.None; AllowsTransparency = true;
         Background = Brushes.Transparent; ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false;
         SizeToContent = SizeToContent.WidthAndHeight;
@@ -1000,14 +1047,36 @@ class GameDock : Window {
         } catch (Exception e) { Alert(T("تعذّرت مراقبة المجلد. اختره مجدداً من القائمة.", "Could not monitor this folder. Choose it again in settings.") + "\n" + e.Message); }
         Refresh();
     }
+    Grid GameVisual(string title,string icon,string steamId) {
+        var box=new Grid {Width=32,Height=32,ClipToBounds=true};
+        BitmapSource art=null;
+        if(!String.IsNullOrEmpty(icon) && File.Exists(icon)) {
+            try {art=GetIcon(icon,true);} catch(ArgumentException) {} catch(COMException) {}
+        }
+        if(art!=null) box.Children.Add(new Image {Source=art});
+        else {
+            box.Children.Add(new TextBlock {Text=String.IsNullOrWhiteSpace(title)?"?":System.Globalization.StringInfo.GetNextTextElement(title),
+                HorizontalAlignment=HorizontalAlignment.Center,VerticalAlignment=VerticalAlignment.Center,FontSize=19});
+            RoutedEventHandler loaded=null;
+            loaded=async delegate {
+                box.Loaded-=loaded;
+                if(String.IsNullOrWhiteSpace(title)) return;
+                var fallback=await GameArtwork.Get(title,steamId);
+                if(fallback!=null && box.IsLoaded) {
+                    box.Children.Clear();
+                    box.Children.Add(new Image {Source=fallback,Stretch=Stretch.UniformToFill});
+                }
+            };
+            box.Loaded+=loaded;
+        }
+        return box;
+    }
     Button EntryTile(int index) {
         string entry = entries[index];
         if (host.automatic) {
             InstalledGame game;
             if (!host.detected.Games.TryGetValue(entry,out game)) return new Button();
-            var art = game.Icon == null ? null : GetIcon(game.Icon);
-            object content = art == null ? (object)new TextBlock { Text=System.Globalization.StringInfo.GetNextTextElement(game.Title), FontSize=22 }
-                : new Image { Source=art, Width=32, Height=32 };
+            var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null);
             var button=Tile(content,game.Title,delegate { Launch(game.Target,game.Arguments); },true);
             EnableDrag(button,entry);
             Canvas.SetLeft(button,Side ? 0 : index*(double)Slot);
@@ -1015,10 +1084,16 @@ class GameDock : Window {
             return button;
         }
         string path = InFolder(entry);
-        var image = GetIcon(path);
-        object visual = image == null ? (object)new TextBlock { Text = "◇", FontSize = 22 } : new Image { Source = image, Width = 32, Height = 32 };
-        bool shortcut = File.Exists(path) && (Link(path) || Url(path));
-        var tile = Tile(visual,shortcut ? Path.GetFileNameWithoutExtension(entry) : entry,delegate { OpenEntry(path); },true);
+        bool shortcut=File.Exists(path) && (Link(path) || Url(path));
+        bool executable=String.Equals(Path.GetExtension(path),".exe",StringComparison.OrdinalIgnoreCase);
+        string title=shortcut || executable ? Path.GetFileNameWithoutExtension(entry) : entry;
+        object visual;
+        if(shortcut || executable) visual=GameVisual(title,path,null);
+        else {
+            var image=GetIcon(path);
+            visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};
+        }
+        var tile=Tile(visual,title,delegate {OpenEntry(path);},true);
         EnableDrag(tile,path);
         Canvas.SetLeft(tile,Side ? 0 : index*(double)Slot);
         Canvas.SetTop(tile,Side ? index*(double)TileHeight : 0);
