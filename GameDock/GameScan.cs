@@ -9,7 +9,7 @@ using System.Xml.Linq;
 using Microsoft.Win32;
 
 internal sealed class InstalledGame {
-    internal string Title, Target, Icon, Arguments;
+    internal string Title, Target, Icon, Arguments, Proof, Manifest;
 }
 
 internal sealed class GameScan {
@@ -38,12 +38,46 @@ internal sealed class GameScan {
         catch (System.Xml.XmlException) {}
     }
     static string Child(string root, string relative) {
-        if (String.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative)) return null;
+        if (String.IsNullOrWhiteSpace(root) || !Path.IsPathRooted(root) || String.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative)) return null;
         string prefix = Path.GetFullPath(root).TrimEnd('\\') + "\\";
         string path = Path.GetFullPath(Path.Combine(prefix,relative));
         return path.StartsWith(prefix,StringComparison.OrdinalIgnoreCase) ? path : null;
     }
-    void Riot(string root) {
+    internal readonly Dictionary<string,string> Aliases = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+    internal string Resolve(string id) {
+        string matched;
+        return Aliases.TryGetValue(id,out matched) ? matched : id;
+    }
+    internal static bool IsLauncher(string file) {
+        return Regex.IsMatch(Path.GetFileNameWithoutExtension(file)??"", @"^(?:steam|epicgameslauncher|riotclientservices|prismlauncher|multimc|minecraftlauncher|ubisoftconnect|upc|battle\.net|galaxyclient|eadesktop|explorer)$",RegexOptions.IgnoreCase);
+    }
+    static bool Utility(string file) {
+        string name=Path.GetFileNameWithoutExtension(file);
+        return IsLauncher(file) || Regex.IsMatch(name,@"^(?:unins\d*|uninstall.*|setup(?:[._-].*)?|install(?:er)?|updater|crashreport.*|crashhandler.*|unitycrash.*|UE(?:4|5)Prereq.*|EasyAntiCheat.*|vc_redist.*|dxsetup|prismlauncher|multimc|minecraftlauncher|riotclientservices|steam|epicgameslauncher)$",RegexOptions.IgnoreCase);
+    }
+    static bool Excluded(string title) {
+        return Regex.IsMatch(title,@"(?:\bPBE\b|public (?:beta|test) (?:environment|server)|\bdedicated server\b|\b(?:mod|map) editor\b|(?:minecraft|prism|multimc)\s*launcher\b)",RegexOptions.IgnoreCase);
+    }
+    static int SourceRank(string id) {
+        if(id.StartsWith("steam-") || id.StartsWith("epic-") || id.StartsWith("riot-") || id.StartsWith("xbox-") || id.StartsWith("gog-") || id=="prism-minecraft") return 0;
+        return id.StartsWith("anker-") ? 1 : 2;
+    }
+    internal void Consolidate() {
+        var names=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+        var proofs=new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+        foreach(var pair in Games.OrderBy(p=>SourceRank(p.Key)).ThenBy(p=>p.Key,StringComparer.OrdinalIgnoreCase).ToArray()) {
+            var game=pair.Value;
+            if(String.IsNullOrWhiteSpace(game.Title) || Excluded(game.Title) || !File.Exists(game.Proof)) {Games.Remove(pair.Key);continue;}
+            string key=GameArtwork.Normalize(game.Title), winner;
+            if(key.Length==0) {Games.Remove(pair.Key);continue;}
+            if(names.TryGetValue(key,out winner) || proofs.TryGetValue(game.Proof,out winner)) {
+                Aliases[pair.Key]=winner; Games.Remove(pair.Key);
+            } else winner=pair.Key;
+            names[key]=winner; proofs[game.Proof]=winner;
+            Watch(Path.GetDirectoryName(game.Proof),Path.GetFileName(game.Proof));
+        }
+    }
+    internal void Riot(string root) {
         string clients = Path.Combine(root,"RiotClientInstalls.json");
         Watch(root,"RiotClientInstalls.json");
         string metadata = Path.Combine(root,"Metadata");
@@ -58,7 +92,7 @@ internal sealed class GameScan {
             string name = Path.GetFileName(dir);
             string[] parts = name.Split('.');
             string title;
-            if (parts.Length!=2 || !products.TryGetValue(parts[0],out title) || (parts[1]!="live" && parts[1]!="pbe")) return;
+            if (parts.Length!=2 || !products.TryGetValue(parts[0],out title) || parts[1]!="live") return;
             string manifest = name+".product_settings.yaml";
             Watch(dir,manifest);
             string file = Path.Combine(dir,manifest);
@@ -66,15 +100,51 @@ internal sealed class GameScan {
             var line = File.ReadLines(file).FirstOrDefault(l=>l.StartsWith("product_install_full_path:",StringComparison.Ordinal));
             if (line==null) return;
             string location = line.Substring(line.IndexOf(':')+1).Trim().Trim('"');
-            if (!Directory.Exists(location) || !Directory.EnumerateFileSystemEntries(location).Any()) return;
-            string suffix = parts[1]=="live" ? "" : "-pbe";
-            Games["riot-"+parts[0]+suffix] = new InstalledGame {Title=title+(suffix==""?"":" (PBE)"),Target=client,Icon=client,Arguments="--launch-product="+parts[0]+" --launch-patchline="+parts[1]};
+            string[] binaries;
+            switch(parts[0]) {
+                case "league_of_legends": binaries=new[]{@"Game\League of Legends.exe"}; break;
+                case "teamfighttactics": binaries=new[]{"TFTClient.exe"}; break;
+                case "valorant": binaries=new[]{@"ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",@"live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"}; break;
+                case "lion": binaries=new[]{@"Lion\Binaries\Win64\Lion-Win64-Shipping.exe","2XKO.exe"}; break;
+                default: binaries=new[]{"LoR.exe","Legends of Runeterra.exe"}; break;
+            }
+            string proof=binaries.Select(p=>Child(location,p)).FirstOrDefault(File.Exists);
+            if(proof==null) return;
+            Games["riot-"+parts[0]] = new InstalledGame {Title=title,Proof=proof,Manifest=file,Target=client,Icon=proof,Arguments="--launch-product="+parts[0]+" --launch-patchline=live"};
         });
+    }
+    // A Ubisoft shortcut can outlive its game. Require a registered install and an executable.
+    void UbisoftShortcut(string file,string title) {
+        string line=File.ReadLines(file).Take(80).FirstOrDefault(l=>l.StartsWith("URL=",StringComparison.OrdinalIgnoreCase));
+        var match=Regex.Match(line??"", @"^URL=uplay://launch/(\d+)(?:/\d+)?/?$",RegexOptions.IgnoreCase);
+        if(!match.Success || Excluded(title)) return;
+        string id=match.Groups[1].Value;
+        foreach(var view in new[]{RegistryView.Registry32,RegistryView.Registry64}) {
+            using(var hive=RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,view))
+            using(var install=hive.OpenSubKey(@"SOFTWARE\Ubisoft\Launcher\Installs\"+id)) {
+                if(install==null) continue;
+                string root=install.GetValue("InstallDir") as string;
+                if(!Directory.Exists(root)) continue;
+                foreach(string rel in new[]{"","bin",@"bin\x64",@"Binaries\Win64"}) {
+                    string dir=Path.Combine(root,rel);
+                    if(!Directory.Exists(dir)) continue;
+                    foreach(var exe in Directory.EnumerateFiles(dir,"*.exe")) {
+                        string name=Path.GetFileNameWithoutExtension(exe);
+                        if(Utility(exe) || (GameArtwork.Normalize(name)!=GameArtwork.Normalize(title) &&
+                            GameArtwork.Normalize(System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).ProductName)!=GameArtwork.Normalize(title))) continue;
+                        Games["uplay-"+id]=new InstalledGame {Title=title,Target="uplay://launch/"+id+"/0",Proof=exe,Icon=exe};
+                        Aliases[line.Substring(4)]="uplay-"+id;
+                        return;
+                    }
+                }
+            }
+        }
     }
     internal void Shortcuts(string directory, bool curated) {
         if (String.IsNullOrWhiteSpace(directory)) return;
         Watch(directory,"*.lnk");
         Watch(directory,"*.url");
+        if(curated) Watch(directory,"*.exe");
         if (!Directory.Exists(directory)) return;
         dynamic shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
         try {
@@ -82,40 +152,22 @@ internal sealed class GameScan {
                 string ext = Path.GetExtension(file).ToLowerInvariant();
                 string title = Path.GetFileNameWithoutExtension(file);
                 string target = file, args = "", id = null;
+                if (ext == ".url") {UbisoftShortcut(file,title);return;}
                 if (ext == ".lnk") {
                     dynamic link = shell.CreateShortcut(file);
                     try { target = link.TargetPath; args = link.Arguments ?? ""; }
                     finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(link); }
-                } else if (ext == ".url") {
-                    var line = File.ReadLines(file).FirstOrDefault(x=>x.StartsWith("URL=",StringComparison.OrdinalIgnoreCase));
-                    if (line == null) return;
-                    target = line.Substring(4).Trim();
-                    var steam = Regex.Match(target,@"^steam://(?:run|rungameid)/(\d+)/?$", RegexOptions.IgnoreCase);
-                    if (steam.Success) id = "steam-"+steam.Groups[1].Value;
-                    else if (!Regex.IsMatch(target,@"^(?:uplay://launch/\d+|battlenet://[a-z0-9]+|com\.epicgames\.launcher://apps/[^\s]+)(?:[/\?][^\s]*)?$",RegexOptions.IgnoreCase)) return;
-                    else id = target;
-                    // A Steam URI can also launch utilities. Only trust a curated entry or a verified game.
-                    if (steam.Success && !curated && !Games.ContainsKey(id)) return;
                 } else if (ext != ".exe" || !curated) return;
-
-                if (ext != ".url") {
-                    if (!File.Exists(target) || !String.Equals(Path.GetExtension(target),".exe",StringComparison.OrdinalIgnoreCase)) return;
-                    string exe = Path.GetFileNameWithoutExtension(target);
-                    if (String.Equals(exe,"RiotClientServices",StringComparison.OrdinalIgnoreCase)) {
-                        var product = Regex.Match(args,@"(?:^|\s)--launch-product=(league_of_legends|teamfighttactics|valorant|bacon)(?:\s|$)",RegexOptions.IgnoreCase);
-                        if (!product.Success) return;
-                        id = "riot-"+product.Groups[1].Value.ToLowerInvariant()+(Regex.IsMatch(args,@"--launch-patchline=pbe(?:\s|$)",RegexOptions.IgnoreCase)?"-pbe":"");
-                    } else {
-                        if (Regex.IsMatch(exe,@"(?:unins|crashreport|unitycrash|setup|installer|updater|redist)",RegexOptions.IgnoreCase)) return;
-                        string parent = Path.GetDirectoryName(target);
-                        if (!curated && !(Directory.Exists(Path.Combine(parent,exe+"_Data")) && File.Exists(Path.Combine(parent,"UnityPlayer.dll"))) &&
-                            !Regex.IsMatch(target,@"\\Binaries\\Win(?:32|64)\\[^\\]+-Shipping\.exe$",RegexOptions.IgnoreCase)) return;
-                        id = target+" "+args;
-                    }
-                }
-                if (id.StartsWith("riot-") && Games.ContainsKey(id)) Games[id].Icon=file;
-                if (Games.ContainsKey(id) || Games.Values.Any(g=>String.Equals(g.Title,title,StringComparison.OrdinalIgnoreCase))) return;
-                Games[id] = new InstalledGame {Title=title, Icon=file, Target=file};
+                // A store URL proves ownership of a shortcut, not installation of the game.
+                if (!File.Exists(target) || !String.Equals(Path.GetExtension(target),".exe",StringComparison.OrdinalIgnoreCase)) return;
+                if (Utility(target) || Excluded(title)) return;
+                string exe=Path.GetFileNameWithoutExtension(target), parent=Path.GetDirectoryName(target);
+                bool unity=File.Exists(Path.Combine(parent,"UnityPlayer.dll")) && Directory.Exists(Path.Combine(parent,exe+"_Data"));
+                bool unreal=Regex.IsMatch(target,@"\\Binaries\\Win(?:32|64)\\[^\\]+-Shipping\.exe$",RegexOptions.IgnoreCase);
+                bool godot=File.Exists(Path.ChangeExtension(target,".pck")) && (System.Diagnostics.FileVersionInfo.GetVersionInfo(target).ProductName??"").IndexOf("Godot",StringComparison.OrdinalIgnoreCase)>=0;
+                if(!unity && !unreal && !godot) return;
+                id=target+" "+args;
+                Games[id]=new InstalledGame {Title=title,Icon=target,Target=file,Proof=target};
             });
         } finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell); }
     }
@@ -134,25 +186,36 @@ internal sealed class GameScan {
         Watch(home,"prismlauncher.cfg");
         string root=Path.GetFullPath(Path.Combine(home,ConfigValue(config,"InstanceDir","instances")));
         Watch(root,"*");
-        bool hasInstance=false;
+        long latest=Int64.MinValue;
+        string best=null, jar=null;
+        var instances=new List<string>();
         if (Directory.Exists(root)) foreach (string dir in Directory.GetDirectories(root)) Try(delegate {
             if (!RealFolder(dir)) return;
             string cfg=Path.Combine(dir,"instance.cfg");
             Watch(dir,"instance.cfg"); Watch(dir,"mmc-pack.json");
             if (!File.Exists(cfg) || !File.Exists(Path.Combine(dir,"mmc-pack.json"))) return;
             string id=Path.GetFileName(dir);
-            string name=ConfigValue(cfg,"name",id);
-            if (!String.Equals(name,id,StringComparison.OrdinalIgnoreCase) && Games.Values.Any(g=>g.Title=="Minecraft · "+name)) name+=" ("+id+")";
-            Games["prism:"+dir]=new InstalledGame {Title="Minecraft · "+name,Icon=exe,Target=exe,
-                Arguments="--dir \""+home.TrimEnd('\\')+"\" --launch \""+id+"\""};
-            hasInstance=true;
+            var pack=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(Path.Combine(dir,"mmc-pack.json")));
+            object rows;
+            if(pack==null || !pack.TryGetValue("components",out rows) || !(rows is System.Collections.IList)) return;
+            var mc=((System.Collections.IList)rows).OfType<Dictionary<string,object>>().FirstOrDefault(c=>Text(c,"uid")=="net.minecraft");
+            string version=mc==null ? "" : Text(mc,"version");
+            if(!Regex.IsMatch(version,@"^[a-z0-9._-]+$",RegexOptions.IgnoreCase)) return;
+            string candidate=Path.Combine(home,@"libraries\com\mojang\minecraft",version,"minecraft-"+version+"-client.jar");
+            Watch(Path.GetDirectoryName(candidate),Path.GetFileName(candidate));
+            if(!File.Exists(candidate)) return;
+            long last; Int64.TryParse(ConfigValue(cfg,"lastLaunchTime","0"),out last);
+            instances.Add(dir);
+            if(last>latest || (last==latest && String.CompareOrdinal(id,best)<0)) {best=id; latest=last; jar=candidate;}
         });
-        if (!hasInstance) Games["prism-launcher"]=new InstalledGame {Title="Minecraft · Prism Launcher",Target=exe,Icon=exe};
+        if(best!=null) {
+            Games["prism-minecraft"]=new InstalledGame {Title="Minecraft",Target=exe,Proof=jar,Arguments="--dir \""+home.TrimEnd('\\')+"\" --launch \""+best+"\""};
+            foreach(var dir in instances) Aliases["prism:"+dir]="prism-minecraft";
+        }
     }
     void AddExternal(string id,string title,string exe) {
-        if (String.IsNullOrWhiteSpace(title) || Games.ContainsKey(id) || Games.Values.Any(g=>
-            String.Equals(g.Target,exe,StringComparison.OrdinalIgnoreCase) || String.Equals(g.Title,title,StringComparison.OrdinalIgnoreCase))) return;
-        Games[id]=new InstalledGame {Title=title,Target=exe,Icon=exe};
+        if (String.IsNullOrWhiteSpace(title) || Games.ContainsKey(id) || Utility(exe)) return;
+        Games[id]=new InstalledGame {Title=title,Target=exe,Icon=exe,Proof=exe};
     }
     internal void Anker(string data) {
         string library=Path.Combine(data,"library.json");
@@ -188,20 +251,51 @@ internal sealed class GameScan {
             Watch(dir,"*");
             foreach(string exe in Directory.GetFiles(dir,"*.exe")) {
                 string name=Path.GetFileNameWithoutExtension(exe);
-                if(Regex.IsMatch(name,"setup|unins|crash|editor|launcher|updater|redist",RegexOptions.IgnoreCase)) continue;
+                if(Utility(exe)) continue;
                 bool unity=File.Exists(Path.Combine(dir,"UnityPlayer.dll")) && Directory.Exists(Path.Combine(dir,name+"_Data"));
                 bool godot=File.Exists(Path.ChangeExtension(exe,".pck")) && System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).FileDescription!=null &&
                     (System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).ProductName??"").IndexOf("Godot",StringComparison.OrdinalIgnoreCase)>=0;
                 bool unreal=Directory.Exists(Path.Combine(dir,"Engine")) && Directory.GetDirectories(dir).Any(sub=>
                     RealFolder(sub) && Directory.Exists(Path.Combine(sub,@"Binaries\Win64")) &&
                     Directory.GetFiles(Path.Combine(sub,@"Binaries\Win64"),"*Shipping.exe").Length>0);
-                if(unity || godot || unreal) {AddExternal("loose:"+exe,name,exe);return;}
+                if(unity || godot || (unreal && Directory.GetDirectories(dir).Any(sub=>GameArtwork.Normalize(Path.GetFileName(sub))==GameArtwork.Normalize(name) || GameArtwork.Normalize(Path.GetFileName(dir))==GameArtwork.Normalize(name)))) {AddExternal("loose:"+exe,name,exe);return;}
             }
             if(depth>1) LooseLibrary(dir,depth-1);
         });
     }
+    internal void Gog(string root,string gameId) {
+        if(!Directory.Exists(root) || !Regex.IsMatch(gameId,@"^\d+$")) return;
+        string manifest=Path.Combine(root,"goggame-"+gameId+".info");
+        Watch(root,Path.GetFileName(manifest));
+        if(!File.Exists(manifest)) return;
+        var item=new JavaScriptSerializer().Deserialize<Dictionary<string,object>>(File.ReadAllText(manifest));
+        object tasks;
+        if(item==null || Text(item,"gameId")!=gameId || !item.TryGetValue("playTasks",out tasks) || !(tasks is System.Collections.IList)) return;
+        foreach(var task in ((System.Collections.IList)tasks).OfType<Dictionary<string,object>>()) {
+            object primary;
+            if(!task.TryGetValue("isPrimary",out primary) || !Object.Equals(primary,true) || !String.Equals(Text(task,"type"),"File",StringComparison.OrdinalIgnoreCase)) continue;
+            string exe=Child(root,Text(task,"path"));
+            if(!File.Exists(exe) || !String.Equals(Path.GetExtension(exe),".exe",StringComparison.OrdinalIgnoreCase) || Utility(exe)) continue;
+            Games["gog-"+gameId]=new InstalledGame {Title=Text(item,"name"),Target=exe,Arguments=Text(task,"arguments"),Proof=exe,Icon=exe,Manifest=manifest};
+            break;
+        }
+    }
+    void RegisteredGames() {
+        foreach(var view in new[]{RegistryView.Registry32,RegistryView.Registry64}) Try(delegate {
+            using(var hive=RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,view))
+            using(var games=hive.OpenSubKey(@"SOFTWARE\GOG.com\Games")) {
+                if(games==null) return;
+                foreach(string id in games.GetSubKeyNames()) Try(delegate {
+                    using(var game=games.OpenSubKey(id)) {
+                        if(game!=null) Gog(game.GetValue("path") as string,id);
+                    }
+                });
+            }
+        });
+    }
     internal static GameScan Read() {
         var scan = new GameScan();
+        scan.RegisteredGames();
         string steam = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),"Steam");
         scan.Try(delegate { steam = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam","SteamPath",steam) as string ?? steam; });
         scan.Try(delegate { scan.Steam(Path.GetFullPath(steam)); });
@@ -240,7 +334,17 @@ internal sealed class GameScan {
         });
         scan.Try(delegate { scan.LooseLibrary(Path.Combine(profile,"Games"),2); });
         scan.Try(delegate { scan.LooseLibrary(Path.Combine(profile,"Downloads"),2); });
+        scan.Consolidate();
         return scan;
+    }
+    internal static bool Ready(InstalledGame game) {
+        if(!File.Exists(game.Proof) || (game.Manifest!=null && !File.Exists(game.Manifest)) ||
+            (Path.IsPathRooted(game.Target) && !File.Exists(game.Target))) return false;
+        if(game.Manifest==null || !game.Manifest.EndsWith(".acf",StringComparison.OrdinalIgnoreCase)) return true;
+        try {
+            uint state;
+            return UInt32.TryParse(Field(File.ReadAllText(game.Manifest),"StateFlags"),out state) && (state & 4)!=0 && (state & (1u|2048u))==0;
+        } catch(IOException) {return false;} catch(UnauthorizedAccessException) {return false;}
     }
     static string Field(string vdf, string key) {
         return Regex.Match(vdf, "\"" + key + "\"\\s*\"([^\"\\r\\n]*)\"", RegexOptions.IgnoreCase).Groups[1].Value.Replace(@"\\",@"\");
@@ -265,7 +369,7 @@ internal sealed class GameScan {
                 string name = Field(data,"name");
                 string dir = Child(Path.Combine(manifests,"common"),Field(data,"installdir"));
                 if (name.Length > 0 && UInt32.TryParse(Field(data,"appid"),out id) &&
-                    UInt32.TryParse(Field(data,"StateFlags"),out state) && (state & 4) != 0 && Directory.Exists(dir))
+                    UInt32.TryParse(Field(data,"StateFlags"),out state) && (state & 4) != 0 && (state & (1u|2048u))==0 && Directory.Exists(dir))
                     candidates[id] = new[]{name,dir};
             });
         });
@@ -299,13 +403,16 @@ internal sealed class GameScan {
                 if (candidates.TryGetValue(id,out game)) {
                     candidates.Remove(id);
                     stream.Position += header;
-                    var common = Common(reader,end,keys);
+                    var launchFiles = new List<string>();
+                    var common = Common(reader,end,keys,launchFiles);
+                    string proof=launchFiles.Where(p=>p.EndsWith(".exe",StringComparison.OrdinalIgnoreCase) && !Utility(p))
+                        .Select(p=>Child(game[1],p.Replace('/','\\'))).FirstOrDefault(File.Exists);
                     string type, icon;
-                    if (common.TryGetValue("type",out type) && String.Equals(type,"game",StringComparison.OrdinalIgnoreCase)) {
+                    if (proof!=null && common.TryGetValue("type",out type) && String.Equals(type,"game",StringComparison.OrdinalIgnoreCase)) {
                         string image = null;
                         if (common.TryGetValue("clienticon",out icon) && Regex.IsMatch(icon,"^[a-f0-9]{40}$",RegexOptions.IgnoreCase))
                             image = Path.Combine(root,"steam","games",icon+".ico");
-                        Games["steam-"+id] = new InstalledGame { Title=game[0],Target="steam://rungameid/"+id,Icon=File.Exists(image)?image:null };
+                        Games["steam-"+id] = new InstalledGame { Title=game[0],Proof=proof,Manifest=Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(game[1])),"appmanifest_"+id+".acf"),Target="steam://rungameid/"+id,Icon=File.Exists(image)?image:null };
                     }
                 }
                 stream.Position = end;
@@ -319,14 +426,14 @@ internal sealed class GameScan {
         }
         throw new InvalidDataException();
     }
-    static Dictionary<string,string> Common(BinaryReader r,long end,string[] keys) {
+    static Dictionary<string,string> Common(BinaryReader r,long end,string[] keys,List<string> launches) {
         var data = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
         var path = new List<string>();
         while(r.BaseStream.Position < end) {
             int kind=r.ReadByte();
             if(kind==8) {
                 if(path.Count==0) break;
-                if(path.Count==2 && path[1]=="common") break;
+
                 path.RemoveAt(path.Count-1); continue;
             }
             string key;
@@ -336,6 +443,7 @@ internal sealed class GameScan {
             else if(kind==1) {
                 string value=CString(r,end);
                 if(path.Count==2 && path[0]=="appinfo" && path[1]=="common") data[key]=value;
+                if(path.Count==4 && path[1]=="config" && path[2]=="launch" && key=="executable") launches.Add(value);
             } else if(kind==2 || kind==3 || kind==4 || kind==6) r.BaseStream.Position+=4;
             else if(kind==7 || kind==10) r.BaseStream.Position+=8;
             else break;
@@ -364,7 +472,7 @@ internal sealed class GameScan {
             if(!Directory.Exists(root)) return;
             string exe=Child(root,Text(item,"LaunchExecutable"));
             if(!File.Exists(exe) || !String.Equals(Path.GetExtension(exe),".exe",StringComparison.OrdinalIgnoreCase)) return;
-            Games["epic-"+Uri.EscapeDataString(app)] = new InstalledGame {Title=title,Icon=exe,Target="com.epicgames.launcher://apps/"+Uri.EscapeDataString(app)+"?action=launch&silent=true"};
+            Games["epic-"+Uri.EscapeDataString(app)] = new InstalledGame {Title=title,Icon=exe,Proof=exe,Manifest=file,Target="com.epicgames.launcher://apps/"+Uri.EscapeDataString(app)+"?action=launch&silent=true"};
         });
     }
     internal void Xbox(string drive) {
@@ -394,7 +502,7 @@ internal sealed class GameScan {
             if (!File.Exists(exe)) { Watch(Path.GetDirectoryName(exe),Path.GetFileName(exe)); return; }
             var visual=xml.Descendants().FirstOrDefault(e=>e.Name.LocalName=="ShellVisuals");
             string title=visual==null ? null : (string)visual.Attribute("DefaultDisplayName");
-            Games["xbox-"+id]=new InstalledGame {Title=String.IsNullOrEmpty(title)||title.StartsWith("ms-resource:",StringComparison.OrdinalIgnoreCase) ? Path.GetFileName(dir):title,Icon=exe,Target=helper};
+            Games["xbox-"+id]=new InstalledGame {Title=String.IsNullOrEmpty(title)||title.StartsWith("ms-resource:",StringComparison.OrdinalIgnoreCase) ? Path.GetFileName(dir):title,Icon=exe,Target=helper,Proof=exe,Manifest=config};
         });
     }
 }

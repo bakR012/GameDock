@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.6.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.7.0.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -320,7 +320,19 @@ class GameDock : Window {
                       catch (UnauthorizedAccessException) { if (watch != null) watch.Dispose(); }
                       catch (ArgumentException) { if (watch != null) watch.Dispose(); }
                 }
-                detected = result; Refresh();
+                // Keep the current dock during a short-lived manifest rewrite.
+                if (!result.Retry || retryCount>=2 || detected.Games.Count==0) {
+                    var previous=detected;
+                    detected=result;
+                    var list=Entries();
+                    if(!entries.SequenceEqual(list,Paths) || list.Any(id=>{
+                        InstalledGame before;
+                        var after=result.Games[id];
+                        return !previous.Games.TryGetValue(id,out before) || before.Title!=after.Title ||
+                            before.Icon!=after.Icon || before.Target!=after.Target || before.Arguments!=after.Arguments ||
+                            before.Proof!=after.Proof || before.Manifest!=after.Manifest;
+                    })) Refresh();
+                }
                 if (result.Retry && retryCount++ < 2) Changed(this,EventArgs.Empty);
                 if (!result.Retry) retryCount = 0;
                 rescan |= addedWatcher;
@@ -336,7 +348,10 @@ class GameDock : Window {
         if (host.automatic) {
             var ids = host.detected.Games.OrderBy(pair=>pair.Value.Title,StringComparer.CurrentCultureIgnoreCase).Select(pair=>pair.Key).ToArray();
             var order = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
-            return order.Intersect(ids,Paths).Concat(ids.Except(order,Paths)).Except(HiddenNames(),Paths).ToArray();
+            var hidden=new HashSet<string>(HiddenNames().Select(host.detected.Resolve),Paths);
+            var ranked=order.Select(host.detected.Resolve).Intersect(ids,Paths);
+            return ranked.Concat(ids.Except(ranked,Paths)).Where(id=>!hidden.Contains(id) &&
+                !hidden.Contains("title:"+GameArtwork.Normalize(host.detected.Games[id].Title))).ToArray();
         }
         var items = new DirectoryInfo(folder).GetFileSystemInfos().AsEnumerable();
         if (!SameFolder(folder,DockStorage) && Directory.Exists(DockStorage))
@@ -472,7 +487,10 @@ class GameDock : Window {
                 if (SameFolder(folder,DesktopFolder) && shortcut) name = placed;
             }
             if (hide) {
-                var names = HiddenNames().Union(new[] { name },Paths).ToArray();
+                InstalledGame game;
+                var keys=host.automatic && host.detected.Games.TryGetValue(name,out game)
+                    ? new[]{name,"title:"+GameArtwork.Normalize(game.Title)} : new[]{name};
+                var names = HiddenNames().Union(keys,Paths).ToArray();
                 Registry.SetValue(HiddenKey,OrderName,names,RegistryValueKind.MultiString);
             }
             Refresh();
@@ -521,6 +539,22 @@ class GameDock : Window {
             var item = new MenuItem { Header = T("إصلاح الاختصار…","Repair shortcut…") };
             item.Click += delegate { Repair(path); };
             menu.Items.Add(item);
+        }
+        if(host.automatic || Link(path) || Url(path) || Paths.Equals(Path.GetExtension(path),".exe")) {
+            var find=new MenuItem {Header=T("البحث عن أيقونة اللعبة","Find game artwork")};
+            find.Click+=async delegate {
+                InstalledGame game;
+                string title=host.automatic && host.detected.Games.TryGetValue(path,out game) ? game.Title : Path.GetFileNameWithoutExtension(path);
+                string id=host.automatic && path.StartsWith("steam-") ? path.Substring(6) : ManualSteamId(path);
+                var art=await GameArtwork.Get(title,id,true);
+                if(closing) return;
+                if(art==null) {Alert(T("ما لقينا صورة مطابقة الآن. جرّب لاحقًا.","No matching artwork was available. Try again later."));return;}
+                try {
+                    Registry.SetValue(prefs+@"\Artwork",GameArtwork.Normalize(title),1);
+                    Refresh();
+                } catch(Exception e) {Alert(e.Message);}
+            };
+            menu.Items.Add(find);
         }
         var remove = new MenuItem { Header = T("إزالة من الشريط","Remove from dock") };
         remove.Click += delegate { RemoveEntry(path,false); };
@@ -863,11 +897,32 @@ class GameDock : Window {
         switchRow.Children.Add(new TextBlock {Text=label,VerticalAlignment=VerticalAlignment.Center});
         body.Children.Add(switchRow);
     }
+    int settingsPage;
     void DrawSettings() {
         var w = settingsWindow;
         w.Title = T("إعدادات GameDock", "GameDock settings");
         w.FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft;
-        var body = new StackPanel { Margin = new Thickness(16,4,16,14) };
+
+        var layout=new DockPanel {Margin=new Thickness(14,10,14,12)};
+        var nav=new UniformGrid {Rows=1,Margin=new Thickness(0,0,0,8)};
+        string[] pages={T("الألعاب","Games"),T("الشريط","Dock"),T("المظهر","Appearance"),T("عام","General")};
+        for(int i=0;i<pages.Length;i++) {
+            int page=i;
+            var tab=SettingButton(pages[i],delegate {settingsPage=page;DrawSettings();},page==settingsPage);
+            nav.Children.Add(tab);
+        }
+        DockPanel.SetDock(nav,Dock.Top); layout.Children.Add(nav);
+        var body=new StackPanel {Margin=new Thickness(6,0,6,6)};
+        switch(settingsPage) {
+            case 0: DrawLibrarySettings(body); break;
+            case 1: DrawDockSettings(body); break;
+            case 2: DrawAppearanceSettings(body); break;
+            default: DrawGeneralSettings(body); break;
+        }
+        layout.Children.Add(new ScrollViewer {VerticalScrollBarVisibility=ScrollBarVisibility.Auto,Content=body});
+        w.Content=layout;
+    }
+    void DrawDockSettings(StackPanel body) {
         AddDisplaySetting(body);
         AddSwitch(body,T("دائمًا في المقدّمة","Always on top"),Topmost,delegate(bool enabled) {
             ApplyTopmost(enabled);
@@ -885,11 +940,19 @@ class GameDock : Window {
                 edge = (Dock)i; SavePreference("DockEdge",i);
                 SetEdgeLayout(); Refresh(); UpdateLayout(); ScrollTo(index * Step); Position();
             });
+    }
+    void DrawGeneralSettings(StackPanel body) {
         Section(body, T("مكان الإعدادات","Settings access"),
             new[] { T("⋯ على الشريط","⋯ On the dock"), T("أيقونة بجانب الساعة","System tray icon") }, useTray ? 1 : 0,
             delegate(int i) { useTray = i == 1; ApplyAccess(); SavePreference("TrayAccess", i); });
         Section(body, T("اللغة","Language"), new[] { "العربية", "English" }, english ? 1 : 0,
             delegate(int i) { english = i == 1; SavePreference("English",i); ApplyAccess(); Refresh(); });
+        bool starts = StartsWithWindows();
+        body.Children.Add(SettingButton(T("تشغيل مع ويندوز","Start with Windows") + (starts ? "  ✓" : ""),
+            delegate { SetStartup(); DrawSettings(); }, starts));
+        body.Children.Add(SettingButton(T("خروج من التطبيق","Quit GameDock"), Close, false));
+    }
+    void DrawAppearanceSettings(StackPanel body) {
         Section(body, T("شكل الشريط","Dock appearance"), new[] { T("شفاف","Transparent"),T("أسود","Black"),T("ملوّن","Color") }, theme,
             delegate(int i) { theme = i; ApplyTheme(); SavePreference("Theme",i); });
         if (theme == 2) ColorEditor(body);
@@ -900,6 +963,8 @@ class GameDock : Window {
         slider.ValueChanged += delegate { visibleCount = (int)Math.Round(slider.Value); count.Text = prefix + visibleCount;
             StopScroll(); Fit(); SavePreference("VisibleCount",visibleCount); };
         body.Children.Add(slider);
+    }
+    void DrawLibrarySettings(StackPanel body) {
         Section(body,T("مصدر الألعاب","Game source"),new[]{T("اكتشاف تلقائي","Automatic discovery"),T("مجلد يدوي","Manual folder")},automatic ? 0 : 1,delegate(int i) {
             if (automatic == (i==0)) return;
             if (i==1 && !Directory.Exists(folder)) { Choose(); if (!Directory.Exists(folder)) return; }
@@ -918,11 +983,6 @@ class GameDock : Window {
                 Registry.SetValue(HiddenKey,OrderName,new string[0],RegistryValueKind.MultiString);
                 Refresh(); DrawSettings();
             },false));
-        bool starts = StartsWithWindows();
-        body.Children.Add(SettingButton(T("تشغيل مع ويندوز","Start with Windows") + (starts ? "  ✓" : ""),
-            delegate { SetStartup(); DrawSettings(); }, starts));
-        body.Children.Add(SettingButton(T("خروج من التطبيق","Quit GameDock"), Close, false));
-        w.Content = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = body };
     }
     void OpenSettings() {
         host.settingsAnchor = this;
@@ -930,7 +990,7 @@ class GameDock : Window {
     }
     void ShowSettings() {
         if (settingsWindow != null) { PositionSettings(); settingsWindow.Activate(); return; }
-        var w = new Window { Owner = this, Topmost = this.Topmost, Width = Math.Min(365,settingsAnchor.WorkArea.Width), SizeToContent = SizeToContent.Height,
+        var w = new Window { Owner = this, Topmost = this.Topmost, Width = Math.Min(410,settingsAnchor.WorkArea.Width), Height=Math.Min(378,settingsAnchor.WorkArea.Height-12),
             MaxHeight = settingsAnchor.WorkArea.Height - 12, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
             WindowStartupLocation = WindowStartupLocation.Manual, FontFamily = new FontFamily("Segoe UI") };
         using (var source = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("GameDock.WhiteGlyph.ico")) {
@@ -1019,7 +1079,7 @@ class GameDock : Window {
         if (w == null || w.ActualWidth == 0 || w.ActualHeight == 0) return;
         var anchor = settingsAnchor;
         var area = anchor.WorkArea;
-        w.Width = Math.Min(365, area.Width);
+        w.Width = Math.Min(410, area.Width);
         w.MaxHeight = Math.Max(1, area.Height - 12);
         double Left = anchor.Left, Top = anchor.Top, ActualWidth = anchor.ActualWidth, ActualHeight = anchor.ActualHeight;
         double x = edge == Dock.Left ? Left + ActualWidth + 6 : edge == Dock.Right ? Left - w.ActualWidth - 6 : Left + (ActualWidth-w.ActualWidth)/2;
@@ -1062,10 +1122,42 @@ class GameDock : Window {
         } catch (Exception e) { Alert(T("تعذّرت مراقبة المجلد. اختره مجدداً من القائمة.", "Could not monitor this folder. Choose it again in settings.") + "\n" + e.Message); }
         Refresh();
     }
+    static string ManualSteamId(string path) {
+        if(!Url(path) || !File.Exists(path)) return null;
+        try {
+            var line=File.ReadLines(path).Take(80).FirstOrDefault(l=>l.StartsWith("URL=",StringComparison.OrdinalIgnoreCase));
+            var match=System.Text.RegularExpressions.Regex.Match(line??"", @"^URL=steam://(?:run|rungameid)/(\d+)/?$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return match.Success ? match.Groups[1].Value : null;
+        } catch(IOException) {} catch(UnauthorizedAccessException) {}
+        return null;
+    }
+    static string ShortcutIcon(string path) {
+        try {
+            if(Url(path)) {
+                string entry=File.ReadLines(path).Take(80).FirstOrDefault(l=>l.StartsWith("IconFile=",StringComparison.OrdinalIgnoreCase));
+                string file=entry==null ? "" : Environment.ExpandEnvironmentVariables(entry.Substring(9).Trim().Trim('"'));
+                return File.Exists(file) ? path : null;
+            }
+            if(Link(path)) {
+                string icon=path;
+                WithLink(path,delegate(dynamic link) {
+                    string spec=(string)link.IconLocation??"";
+                    int comma=spec.LastIndexOf(',');
+                    string file=Environment.ExpandEnvironmentVariables((comma<0?spec:spec.Substring(0,comma)).Trim().Trim('"'));
+                    string target=(string)link.TargetPath??"";
+                    if(!File.Exists(file) && (!File.Exists(target) || GameScan.IsLauncher(target))) icon=null;
+                    else if(!File.Exists(file)) icon=target;
+                    else if(GameScan.IsLauncher(file)) icon=null;
+                });
+                return icon;
+            }
+        } catch(Exception) {return null;}
+        return path;
+    }
     Grid GameVisual(string title,string icon,string steamId) {
         var box=new Grid {Width=32,Height=32,ClipToBounds=true};
         BitmapSource art=null;
-        if(!String.IsNullOrEmpty(icon) && File.Exists(icon)) {
+        if(!Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1) && !String.IsNullOrEmpty(icon) && File.Exists(icon)) {
             try {art=GetIcon(icon,true);} catch(ArgumentException) {} catch(COMException) {}
         }
         if(art!=null) box.Children.Add(new Image {Source=art});
@@ -1092,7 +1184,10 @@ class GameDock : Window {
             InstalledGame game;
             if (!host.detected.Games.TryGetValue(entry,out game)) return new Button();
             var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null);
-            var button=Tile(content,game.Title,delegate { Launch(game.Target,game.Arguments); },true);
+            var button=Tile(content,game.Title,delegate {
+                if(!GameScan.Ready(game)) {host.ScanGames();return;}
+                Launch(game.Target,game.Arguments);
+            },true);
             EnableDrag(button,entry);
             Canvas.SetLeft(button,Side ? 0 : index*(double)Slot);
             Canvas.SetTop(button,Side ? index*(double)TileHeight : 0);
@@ -1103,7 +1198,7 @@ class GameDock : Window {
         bool executable=String.Equals(Path.GetExtension(path),".exe",StringComparison.OrdinalIgnoreCase);
         string title=shortcut || executable ? Path.GetFileNameWithoutExtension(entry) : entry;
         object visual;
-        if(shortcut || executable) visual=GameVisual(title,path,null);
+        if(shortcut || executable) visual=GameVisual(title,shortcut ? ShortcutIcon(path) : path,ManualSteamId(path));
         else {
             var image=GetIcon(path);
             visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};
