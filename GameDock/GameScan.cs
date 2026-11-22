@@ -119,6 +119,87 @@ internal sealed class GameScan {
             });
         } finally { System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell); }
     }
+    static bool RealFolder(string path) {
+        return Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint)==0;
+    }
+    static string ConfigValue(string path,string key,string fallback) {
+        if (!File.Exists(path)) return fallback;
+        string line=File.ReadLines(path).FirstOrDefault(l=>l.StartsWith(key+"=",StringComparison.OrdinalIgnoreCase));
+        return line==null ? fallback : line.Substring(key.Length+1).Trim();
+    }
+    internal void Prism(string exe,string home) {
+        Watch(Path.GetDirectoryName(exe),Path.GetFileName(exe));
+        if (!File.Exists(exe)) return;
+        string config=Path.Combine(home,"prismlauncher.cfg");
+        Watch(home,"prismlauncher.cfg");
+        string root=Path.GetFullPath(Path.Combine(home,ConfigValue(config,"InstanceDir","instances")));
+        Watch(root,"*");
+        bool hasInstance=false;
+        if (Directory.Exists(root)) foreach (string dir in Directory.GetDirectories(root)) Try(delegate {
+            if (!RealFolder(dir)) return;
+            string cfg=Path.Combine(dir,"instance.cfg");
+            Watch(dir,"instance.cfg"); Watch(dir,"mmc-pack.json");
+            if (!File.Exists(cfg) || !File.Exists(Path.Combine(dir,"mmc-pack.json"))) return;
+            string id=Path.GetFileName(dir);
+            string name=ConfigValue(cfg,"name",id);
+            if (!String.Equals(name,id,StringComparison.OrdinalIgnoreCase) && Games.Values.Any(g=>g.Title=="Minecraft · "+name)) name+=" ("+id+")";
+            Games["prism:"+dir]=new InstalledGame {Title="Minecraft · "+name,Icon=exe,Target=exe,
+                Arguments="--dir \""+home.TrimEnd('\\')+"\" --launch \""+id+"\""};
+            hasInstance=true;
+        });
+        if (!hasInstance) Games["prism-launcher"]=new InstalledGame {Title="Minecraft · Prism Launcher",Target=exe,Icon=exe};
+    }
+    void AddExternal(string id,string title,string exe) {
+        if (String.IsNullOrWhiteSpace(title) || Games.ContainsKey(id) || Games.Values.Any(g=>
+            String.Equals(g.Target,exe,StringComparison.OrdinalIgnoreCase) || String.Equals(g.Title,title,StringComparison.OrdinalIgnoreCase))) return;
+        Games[id]=new InstalledGame {Title=title,Target=exe,Icon=exe};
+    }
+    internal void Anker(string data) {
+        string library=Path.Combine(data,"library.json");
+        Watch(data,"library.json");
+        if (!File.Exists(library)) return;
+        var parser=new JavaScriptSerializer {MaxJsonLength=32*1024*1024};
+        var doc=parser.Deserialize<Dictionary<string,object>>(File.ReadAllText(library));
+        object raw;
+        if(doc==null || !doc.TryGetValue("games",out raw) || !(raw is Dictionary<string,object>)) return;
+        foreach(var pair in (Dictionary<string,object>)raw) Try(delegate {
+            var item=pair.Value as Dictionary<string,object>;
+            if(item==null) return;
+            string root=Text(item,"root");
+            if(root.StartsWith(@"\\?\")) root=root.Substring(4);
+            if(!Directory.Exists(root) || !File.Exists(Path.Combine(root,".anker-installation.json"))) return;
+            object options;
+            var names=new List<string>{Text(item,"executable")};
+            if(item.TryGetValue("launch_options",out options) && options is System.Collections.IEnumerable && !(options is string)) names.AddRange(((System.Collections.IEnumerable)options).Cast<object>().OfType<string>());
+            var dirs=new List<string>{root};
+            dirs.AddRange(Directory.GetDirectories(root).Where(RealFolder));
+            foreach(string name in names.Where(n=>n.EndsWith(".exe",StringComparison.OrdinalIgnoreCase))) foreach(string dir in dirs) {
+                string exe=Child(dir,name);
+                if(File.Exists(exe)) { AddExternal("anker-"+pair.Key,Text(item,"title"),exe); return; }
+            }
+        });
+    }
+    // Inspect shallow installation folders only. Watch filenames, never content writes or the whole drive.
+    internal void LooseLibrary(string root,int depth) {
+        if (!RealFolder(root)) {Watch(root,"*");return;}
+        Watch(root,"*");
+        foreach(string dir in Directory.GetDirectories(root)) Try(delegate {
+            if(!RealFolder(dir) || Path.GetFileName(dir).StartsWith(".")) return;
+            Watch(dir,"*");
+            foreach(string exe in Directory.GetFiles(dir,"*.exe")) {
+                string name=Path.GetFileNameWithoutExtension(exe);
+                if(Regex.IsMatch(name,"setup|unins|crash|editor|launcher|updater|redist",RegexOptions.IgnoreCase)) continue;
+                bool unity=File.Exists(Path.Combine(dir,"UnityPlayer.dll")) && Directory.Exists(Path.Combine(dir,name+"_Data"));
+                bool godot=File.Exists(Path.ChangeExtension(exe,".pck")) && System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).FileDescription!=null &&
+                    (System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).ProductName??"").IndexOf("Godot",StringComparison.OrdinalIgnoreCase)>=0;
+                bool unreal=Directory.Exists(Path.Combine(dir,"Engine")) && Directory.GetDirectories(dir).Any(sub=>
+                    RealFolder(sub) && Directory.Exists(Path.Combine(sub,@"Binaries\Win64")) &&
+                    Directory.GetFiles(Path.Combine(sub,@"Binaries\Win64"),"*Shipping.exe").Length>0);
+                if(unity || godot || unreal) {AddExternal("loose:"+exe,name,exe);return;}
+            }
+            if(depth>1) LooseLibrary(dir,depth-1);
+        });
+    }
     internal static GameScan Read() {
         var scan = new GameScan();
         string steam = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),"Steam");
@@ -147,6 +228,18 @@ internal sealed class GameScan {
             if (!new[]{desktop,commonDesktop}.Contains(chosen,StringComparer.OrdinalIgnoreCase))
                 scan.Shortcuts(chosen,true);
         });
+        string roaming=Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        string profile=Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        scan.Try(delegate { scan.Anker(Path.Combine(roaming,"net.ankergames.launcher")); });
+        string home=Path.Combine(roaming,"PrismLauncher");
+        foreach(var programs in new[]{Path.Combine(profile,@"AppData\Local\Programs"),Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles)}) {
+            scan.Try(delegate { scan.Prism(Path.Combine(programs,@"PrismLauncher\prismlauncher.exe"),home); });
+        }
+        foreach(var drive in DriveInfo.GetDrives()) scan.Try(delegate {
+            if(drive.DriveType==DriveType.Fixed && drive.IsReady) scan.LooseLibrary(Path.Combine(drive.RootDirectory.FullName,"Games"),2);
+        });
+        scan.Try(delegate { scan.LooseLibrary(Path.Combine(profile,"Games"),2); });
+        scan.Try(delegate { scan.LooseLibrary(Path.Combine(profile,"Downloads"),2); });
         return scan;
     }
     static string Field(string vdf, string key) {

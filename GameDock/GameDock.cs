@@ -18,7 +18,7 @@ using Forms = System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
 class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -257,7 +257,7 @@ class GameDock : Window {
     }
     static void Alert(string message) { MessageBox.Show(message, "GameDock"); }
     void Launch(string path,string arguments = "") {
-        try { Process.Start(new ProcessStartInfo(path,arguments ?? "") { UseShellExecute = true }); }
+        try { Process.Start(new ProcessStartInfo(path,arguments ?? "") { UseShellExecute = true, WorkingDirectory = File.Exists(path) ? Path.GetDirectoryName(path) : "" }); }
         catch (Exception e) { Alert(T("تعذّر فتح العنصر.", "Could not open this item.") + "\n" + e.Message); }
     }
     const string OrderKey = prefs + @"\Order";
@@ -450,7 +450,7 @@ class GameDock : Window {
     }
     void RemoveEntry(string path,bool toDesktop) {
         try {
-            string name = Path.GetFileName(path);
+            string name = host.automatic ? path : Path.GetFileName(path);
             bool hide = true;
             if (toDesktop && !host.automatic) {
                 bool shortcut = File.Exists(path) && (Link(path) || Url(path));
@@ -479,7 +479,7 @@ class GameDock : Window {
         tile.GiveFeedback += delegate(object sender,GiveFeedbackEventArgs e) {
             if (ownDrag && OverDesktop()) { e.UseDefaultCursors = false; Mouse.SetCursor(Cursors.Arrow); e.Handled = true; }
         };
-        tile.Tag = Path.GetFileName(path);
+        tile.Tag = host.automatic ? path : Path.GetFileName(path);
         tile.PreviewMouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e) {
             dragOrigin = tile; dragStart = e.GetPosition(this);
         };
@@ -504,7 +504,7 @@ class GameDock : Window {
     }
     void OpenItemMenu(Button tile,string path) {
         var menu = new ContextMenu { FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft };
-        if (Link(path) || Url(path)) {
+        if (!host.automatic && (Link(path) || Url(path))) {
             var item = new MenuItem { Header = T("إصلاح الاختصار…","Repair shortcut…") };
             item.Click += delegate { Repair(path); };
             menu.Items.Add(item);
@@ -564,7 +564,7 @@ class GameDock : Window {
             var added = new System.Collections.Generic.List<string>();
             foreach (string file in files) {
                 if (local && !host.automatic && !File.Exists(file) && !Directory.Exists(file)) return;
-                string name = local ? Path.GetFileName(file) : ImportEntry(file);
+                string name = local ? (host.automatic ? file : Path.GetFileName(file)) : ImportEntry(file);
                 int previous = order.FindIndex(n => Paths.Equals(n,name));
                 if (previous >= 0) { order.RemoveAt(previous); if (previous < gap) gap--; }
                 if (!added.Contains(name,Paths)) added.Add(name);
@@ -853,6 +853,11 @@ class GameDock : Window {
         files.Children.Add(SettingButton(T("تغيير المجلد","Change folder"), Choose, false));
         if (automatic) body.Children.Add(SettingButton(T("تحديث قائمة الألعاب","Refresh detected games"),ScanGames,false));
         else body.Children.Add(files);
+        if ((automatic || Directory.Exists(folder)) && HiddenNames().Length > 0)
+            body.Children.Add(SettingButton(T("إظهار العناصر المخفية","Restore hidden items"),delegate {
+                Registry.SetValue(HiddenKey,OrderName,new string[0],RegistryValueKind.MultiString);
+                Refresh(); DrawSettings();
+            },false));
         bool starts = StartsWithWindows();
         body.Children.Add(SettingButton(T("تشغيل مع ويندوز","Start with Windows") + (starts ? "  ✓" : ""),
             delegate { SetStartup(); DrawSettings(); }, starts));
