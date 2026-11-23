@@ -16,10 +16,12 @@ using System.Windows.Threading;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
+[assembly: System.Reflection.AssemblyCompany("bakR")]
+[assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.8.0.0")]
-class GameDock : Window {
+[assembly: System.Reflection.AssemblyFileVersion("1.9.0.0")]
+partial class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
@@ -329,7 +331,7 @@ class GameDock : Window {
                     detected=result;
                     var list=Entries();
                     if(!entries.SequenceEqual(list,Paths) || list.Any(id=>{
-                        if(DockPins.IsPin(id)) return false;
+                        if(DockPins.IsPin(id) || SelectedMinecraft(id)) return false;
                         InstalledGame before;
                         var after=result.Games[id];
                         return !previous.Games.TryGetValue(id,out before) || before.Title!=after.Title ||
@@ -353,7 +355,7 @@ class GameDock : Window {
         manualGames.Clear();
         if (host.automatic) {
             var order = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
-            return host.pins.Entries(host.detected,order,HiddenNames());
+            return WithMinecraft(host.pins.Entries(host.detected,order,HiddenNames()),order);
         }
         var items = new DirectoryInfo(folder).GetFileSystemInfos().AsEnumerable();
         if (!SameFolder(folder,DockStorage) && Directory.Exists(DockStorage))
@@ -372,7 +374,7 @@ class GameDock : Window {
         } finally {if(shortcutShell!=null) Marshal.FinalReleaseComObject(shortcutShell);}
         entries=entries.Where(name=>!manualGames.ContainsKey(name) || !manualGames[name].LauncherOnly).ToArray();
         var saved = ReadSetting(OrderKey,OrderName,null) as string[] ?? new string[0];
-        return saved.Intersect(entries,Paths).Concat(entries.Except(saved,Paths)).Except(HiddenNames(),Paths).ToArray();
+        return WithMinecraft(saved.Intersect(entries,Paths).Concat(entries.Except(saved,Paths)).Except(HiddenNames(),Paths).ToArray(),saved);
     }
     static bool Link(string path) { return Paths.Equals(Path.GetExtension(path),".lnk"); }
     static bool Url(string path) { return Paths.Equals(Path.GetExtension(path),".url"); }
@@ -494,9 +496,9 @@ class GameDock : Window {
     }
     void RemoveEntry(string path,bool toDesktop) {
         try {
-            string name = host.automatic ? path : Path.GetFileName(path);
+            string name = host.automatic || SelectedMinecraft(path) ? path : Path.GetFileName(path);
             bool hide = true;
-            if (toDesktop && !host.automatic) {
+            if (toDesktop && !host.automatic && !SelectedMinecraft(path)) {
                 bool shortcut = File.Exists(path) && (Link(path) || Url(path));
                 string placed = PlaceEntry(path,DesktopFolder,true,shortcut);
                 hide = !shortcut || SameFolder(folder,DesktopFolder);
@@ -526,7 +528,7 @@ class GameDock : Window {
         tile.GiveFeedback += delegate(object sender,GiveFeedbackEventArgs e) {
             if (ownDrag && OverDesktop()) { e.UseDefaultCursors = false; Mouse.SetCursor(Cursors.Arrow); e.Handled = true; }
         };
-        tile.Tag = host.automatic ? path : Path.GetFileName(path);
+        tile.Tag = host.automatic || SelectedMinecraft(path) ? path : Path.GetFileName(path);
         tile.PreviewMouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e) {
             dragOrigin = tile; dragStart = e.GetPosition(this);
         };
@@ -551,6 +553,13 @@ class GameDock : Window {
     }
     void OpenItemMenu(Button tile,string path) {
         var menu = new ContextMenu { FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft };
+        if(SelectedMinecraft(path)) {
+            var settingsItem=new MenuItem {Header=T("إعدادات Minecraft","Minecraft settings")};
+            settingsItem.Click+=delegate {OpenMinecraftSettings();}; menu.Items.Add(settingsItem);
+            var hide=new MenuItem {Header=T("إزالة من الشريط","Remove from dock")};
+            hide.Click+=delegate {RemoveEntry(path,false);}; menu.Items.Add(hide);
+            menu.PlacementTarget=tile; menu.IsOpen=true; return;
+        }
         bool pin=host.automatic && DockPins.IsPin(path);
         string shortcut=pin ? host.pins.FileFor(path) : path;
         if ((!host.automatic || pin) && (Link(shortcut) || Url(shortcut))) {
@@ -649,9 +658,9 @@ class GameDock : Window {
             var errors = new List<string>();
             foreach (string file in files) {
                 if(String.IsNullOrEmpty(file)) continue;
-                if (local && !host.automatic && !File.Exists(file) && !Directory.Exists(file)) continue;
+                if (local && !host.automatic && !SelectedMinecraft(file) && !File.Exists(file) && !Directory.Exists(file)) continue;
                 string name;
-                try {name=local ? (host.automatic ? file : Path.GetFileName(file)) :
+                try {name=local ? (host.automatic || SelectedMinecraft(file) ? file : Path.GetFileName(file)) :
                     host.automatic ? host.pins.Add(file) : ImportEntry(file);}
                 catch(Exception ex) {errors.Add(Path.GetFileName(file)+" — "+ex.Message); continue;}
                 int previous = order.FindIndex(n => Paths.Equals(n,name));
@@ -956,21 +965,25 @@ class GameDock : Window {
         w.Title = T("إعدادات GameDock", "GameDock settings");
         w.FlowDirection = english ? FlowDirection.LeftToRight : FlowDirection.RightToLeft;
 
-        var layout=new DockPanel {Margin=new Thickness(14,10,14,12)};
-        var nav=new UniformGrid {Rows=1,Margin=new Thickness(0,0,0,8)};
-        string[] pages={T("المكتبة","Library"),T("الشريط","Dock"),T("المظهر","Appearance"),T("عام","General")};
+        var layout=new DockPanel {Margin=new Thickness(14)};
+        var nav=new StackPanel {Width=104,Margin=new Thickness(0,0,8,0)};
+        string[] pages={T("عام","General"),T("المكتبة","Library"),T("الألعاب","Games"),T("المظهر","Appearance"),T("عن التطبيق","About")};
+        nav.Children.Add(new TextBlock {Text="GameDock",FontSize=17,FontWeight=FontWeights.Bold,Margin=new Thickness(4,1,4,14)});
         for(int i=0;i<pages.Length;i++) {
             int page=i;
-            var tab=SettingButton(pages[i],delegate {settingsPage=page;DrawSettings();},page==settingsPage);
+            string label=pages[i]+(i==4 && published!=null && published>ProjectInfo.Current ? " •" : "");
+            var tab=SettingButton(label,delegate {settingsPage=page; minecraftDetails=false; DrawSettings();},page==settingsPage);
             nav.Children.Add(tab);
         }
-        DockPanel.SetDock(nav,Dock.Top); layout.Children.Add(nav);
+        DockPanel.SetDock(nav,Dock.Left); layout.Children.Add(nav);
         var body=new StackPanel {Margin=new Thickness(6,0,6,6)};
+        Heading(body,settingsPage==2 && minecraftDetails ? "Minecraft" : pages[settingsPage]);
         switch(settingsPage) {
-            case 0: DrawLibrarySettings(body); break;
-            case 1: DrawDockSettings(body); break;
-            case 2: DrawAppearanceSettings(body); break;
-            default: DrawGeneralSettings(body); break;
+            case 0: DrawDockSettings(body); DrawGeneralSettings(body); break;
+            case 1: DrawLibrarySettings(body); break;
+            case 2: DrawGameSettings(body); break;
+            case 3: DrawAppearanceSettings(body); break;
+            default: DrawAbout(body); break;
         }
         layout.Children.Add(new ScrollViewer {VerticalScrollBarVisibility=ScrollBarVisibility.Auto,Content=body});
         w.Content=layout;
@@ -1030,10 +1043,6 @@ class GameDock : Window {
         AddSwitch(body,T("تنزيل أيقونات الألعاب تلقائيًا","Download game icons automatically"),downloadIcons,delegate(bool on) {
             downloadIcons=on; SavePreference("AutoDownloadIcons",on ? 1 : 0); Refresh();
         });
-        if(automatic) Section(body,T("عند فتح Minecraft من Prism","When opening Minecraft with Prism"),
-            new[]{T("اختيار النسخة","Choose a profile"),T("آخر نسخة لعبتها","Last played profile")},lastMinecraftProfile ? 1 : 0,delegate(int i) {
-                lastMinecraftProfile=i==1; SavePreference("LastMinecraftProfile",i);
-            });
         files.Children.Add(SettingButton(T("فتح المجلد","Open folder"), delegate { Launch(folder); }, false));
         files.Children.Add(SettingButton(T("تغيير المجلد","Change folder"), Choose, false));
         if (automatic) {
@@ -1055,7 +1064,7 @@ class GameDock : Window {
     }
     void ShowSettings() {
         if (settingsWindow != null) { PositionSettings(); settingsWindow.Activate(); return; }
-        var w = new Window { Owner = this, Topmost = this.Topmost, Width = Math.Min(410,settingsAnchor.WorkArea.Width), Height=Math.Min(378,settingsAnchor.WorkArea.Height-12),
+        var w = new Window { Owner = this, Topmost = this.Topmost, Width = Math.Min(555,settingsAnchor.WorkArea.Width), Height=Math.Min(455,settingsAnchor.WorkArea.Height-12),
             MaxHeight = settingsAnchor.WorkArea.Height - 12, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
             WindowStartupLocation = WindowStartupLocation.Manual, FontFamily = new FontFamily("Segoe UI") };
         using (var source = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("GameDock.WhiteGlyph.ico")) {
@@ -1109,6 +1118,7 @@ class GameDock : Window {
         };
         Loaded += delegate {
             if (host != this) return;
+            StartupUpdateCheck();
             try { if (File.Exists(settings)) folder = File.ReadAllText(settings); } catch (IOException) {}
             if (automatic) { Refresh(); ArrangeDisplays(); ScanGames(); return; }
             if (!Directory.Exists(folder)) Choose();
@@ -1151,7 +1161,7 @@ class GameDock : Window {
         if (w == null || w.ActualWidth == 0 || w.ActualHeight == 0) return;
         var anchor = settingsAnchor;
         var area = anchor.WorkArea;
-        w.Width = Math.Min(410, area.Width);
+        w.Width = Math.Min(555, area.Width);
         w.MaxHeight = Math.Max(1, area.Height - 12);
         double Left = anchor.Left, Top = anchor.Top, ActualWidth = anchor.ActualWidth, ActualHeight = anchor.ActualHeight;
         double x = edge == Dock.Left ? Left + ActualWidth + 6 : edge == Dock.Right ? Left - w.ActualWidth - 6 : Left + (ActualWidth-w.ActualWidth)/2;
@@ -1204,6 +1214,7 @@ class GameDock : Window {
             catch(ArgumentException) {} catch(COMException) {}
             if(art!=null) {source=file; break;}
         }
+        if(art==null && GameArtwork.Normalize(title)=="minecraft") art=MinecraftLogo;
         if(art!=null) {
             box.Children.Add(new Image {Source=art});
         } else {
@@ -1215,7 +1226,7 @@ class GameDock : Window {
                 box.Loaded-=loaded;
                 if(String.IsNullOrWhiteSpace(title)) return;
                 bool repaired=Object.Equals(ReadSetting(prefs+@"\Artwork",GameArtwork.Normalize(title),0),1);
-                if(art!=null) await GameArtwork.RememberLocal(title,steamId,source,art);
+                if(art!=null && source!=null) await GameArtwork.RememberLocal(title,steamId,source,art);
                 if(art!=null && !repaired) return;
                 BitmapSource fallback=null;
                 if(repaired) fallback=await GameArtwork.Get(title,steamId,false,null,false);
@@ -1233,6 +1244,13 @@ class GameDock : Window {
     }
     Button EntryTile(int index) {
         string entry = entries[index];
+        if(SelectedMinecraft(entry)) {
+            var mc=Tile(GameVisual("Minecraft",null,null),"Minecraft",host.OpenSelectedMinecraft,true);
+            EnableDrag(mc,entry);
+            Canvas.SetLeft(mc,Side ? 0 : index*(double)Slot);
+            Canvas.SetTop(mc,Side ? index*(double)TileHeight : 0);
+            return mc;
+        }
         bool pin=host.automatic && DockPins.IsPin(entry);
         if (host.automatic && !pin) {
             InstalledGame game;

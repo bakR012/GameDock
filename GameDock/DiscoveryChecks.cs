@@ -262,6 +262,23 @@ internal static class DiscoveryChecks {
                 return 0;
             }
             RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons(); PersonalPins();
+            const string release="{\"tag_name\":\"v1.10.0\",\"draft\":false,\"prerelease\":false}";
+            Check(ProjectInfo.PublishedVersion(release)>new Version(1,9,0,0),"update check compares numeric versions");
+            foreach(string invalid in new[]{release.Replace("false","true"),release.Replace("v1.10.0","v1.10.0-beta.1"),"{}"}) {
+                try {ProjectInfo.PublishedVersion(invalid);throw new Exception("Unexpected release format accepted");}
+                catch(InvalidDataException) {}
+            }
+            Check(true,"only stable published release tags are accepted");
+            Check(MinecraftLauncher.Known("Lunar Client")=="Lunar Client" && MinecraftLauncher.Known("Badlion Client")=="Badlion Client" &&
+                MinecraftLauncher.Known("TLauncher")=="TLauncher" && MinecraftLauncher.Known("Updater")==null &&
+                MinecraftLauncher.SupportsFile("custom.lnk") && MinecraftLauncher.SupportsFile("portable.jar"),"Minecraft launcher discovery and custom selection");
+            string[] original={"pin:app.lnk","prism-minecraft","other"}, ranked={"other","prism-minecraft","pin:app.lnk"};
+            Check(GameDock.MinecraftEntries(original,ranked,false,id=>id=="prism-minecraft").SequenceEqual(new[]{"other","minecraft:choice","pin:app.lnk"}),
+                "changing Minecraft launcher preserves order and replaces detected Minecraft");
+            Check(GameDock.MinecraftEntries(original,ranked,true,id=>id=="prism-minecraft").SequenceEqual(new[]{"pin:app.lnk","other"}),
+                "hiding configured Minecraft survives a rescan");
+            using(var art=typeof(GameDock).Assembly.GetManifestResourceStream("GameDock.Minecraft.png"))
+                Check(GameArtwork.Decode(new BinaryReader(art).ReadBytes((int)art.Length)).PixelWidth==32,"Minecraft logo available offline");
             Check(GameArtwork.LookupTitle("TeamfightTactics")=="Teamfight Tactics" &&
                 GameArtwork.Normalize("Sky Walk™ 2")==GameArtwork.Normalize("SkyWalk2"),"artwork title matching");
             return 0;

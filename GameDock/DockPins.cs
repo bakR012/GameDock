@@ -24,6 +24,11 @@ internal sealed class DockPins {
         EnsureLoaded();
         return items.ContainsKey(id) ? Path.Combine(directory,id.Substring(4)) : null;
     }
+    internal bool IsMinecraft(string id) {
+        EnsureLoaded();
+        ManualGame item;
+        return items.TryGetValue(id,out item) && GameArtwork.Normalize(item.Title)=="minecraft";
+    }
     void EnsureLoaded() {
         if(loaded) return;
         items.Clear();
