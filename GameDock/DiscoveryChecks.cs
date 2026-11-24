@@ -251,29 +251,58 @@ internal static class DiscoveryChecks {
             Check(String.Equals(saved.Target,launcherPath,StringComparison.OrdinalIgnoreCase) && saved.Arguments=="--launch pack","pin preserves a launcher's exact profile arguments");
         } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell);}
     }
+    static void CheckNativeFrames() {
+        var trace=new NativeFrames(71);
+        var data=System.Runtime.InteropServices.Marshal.AllocHGlobal(16);
+        try {
+            long hz=System.Diagnostics.Stopwatch.Frequency;
+            var r=new NativeFrames.Record {Provider=new Guid("ca11c036-0102-4a2d-a6ad-f03cfed5d3c9"),
+                Thread=1,Pid=71,Data=data,Length=16,Flags=0x20};
+            for(int i=0;i<=60;i++) {
+                r.Stamp=hz+i*hz/60;r.Id=42;
+                System.Runtime.InteropServices.Marshal.WriteInt32(data,100);
+                System.Runtime.InteropServices.Marshal.WriteInt32(data,4,0);trace.Accept(ref r);
+                r.Id=43;System.Runtime.InteropServices.Marshal.WriteInt32(data,0);trace.Accept(ref r);
+                r.Stamp++;r.Id=42;System.Runtime.InteropServices.Marshal.WriteInt32(data,4,1);trace.Accept(ref r);
+                r.Id=43;trace.Accept(ref r);
+            }
+            Check(Math.Abs(trace.Rate(2*hz)-60)<0.01,"32-bit DXGI presentation events decode correctly and skip test presents");
+            var older=new NativeFrames(71);r.Provider=new Guid("783aca0a-790e-4d7f-8451-aa850511c6b9");r.Flags=0x40;
+            for(int i=0;i<=30;i++) {
+                r.Stamp=hz+i*hz/30;r.Id=1;System.Runtime.InteropServices.Marshal.WriteInt64(data,780);
+                System.Runtime.InteropServices.Marshal.WriteInt32(data,8,0);older.Accept(ref r);
+                r.Id=2;System.Runtime.InteropServices.Marshal.WriteInt32(data,0);older.Accept(ref r);
+            }
+            Check(Math.Abs(older.Rate(2*hz)-30)<0.01,"64-bit Direct3D 9 presents are counted");
+        } finally {System.Runtime.InteropServices.Marshal.FreeHGlobal(data);}
+    }
     static void FrameRates() {
         var meter=new FrameSamples(42);
-        meter.Read("Application,ProcessID,SwapChainAddress,TimeInSeconds,MsBetweenPresents",0);
-        var culture=System.Globalization.CultureInfo.InvariantCulture;
-        long now=System.Diagnostics.Stopwatch.Frequency;
+        long hz=System.Diagnostics.Stopwatch.Frequency,baseline=hz*10;
         for(int i=0;i<=120;i++) {
-            string stamp=(i/120.0).ToString("F8",culture);
-            meter.Read("Main,Game.exe,42,0xAA,"+stamp+",8.33",now);
-            if(i%2==0) meter.Read("game.exe,42,0xBB,"+stamp+",16.67",now);
-            meter.Read("other.exe,77,0xCC,"+stamp+",0",now);
+            long stamp=baseline+i*hz/120;
+            meter.Add(100,stamp);
+            if(i%2==0) meter.Add(200,stamp);
         }
-        Check(Math.Abs(meter.Rate(now)-120)<0.01,"FPS reads the dominant swap chain without adding secondary presents");
-        for(int i=1;i<=60;i++)
-            meter.Read("game.exe,42,0xAA,"+(1+i/30.0).ToString("F8",culture)+",33.33",now*4);
-        Check(Math.Abs(meter.Rate(now*4)-30)<0.01,"FPS adapts to a frame rate change using presentation time");
-        Check(meter.Rate(now*7)==0,"FPS hides stale frames after a stall");
-        var other=new FrameSamples(7);
-        other.Read("Application,ProcessID,SwapChainAddress,TimeInSeconds",0);
-        foreach(string row in new[]{"bad","a,42,aa,3","a,42,aa,4","a,7,aa,NaN","a,7,aa,Infinity","a,7,aa,1","a,7,aa,1"})
-            other.Read(row,0);
-        Check(other.Rate(0)==0,"FPS ignores other processes, invalid times and duplicate timestamps");
-        other.Read("a,7,aa,3",now);
-        Check(other.Rate(now)==0.5,"FPS represents slow rendering without rounding it to zero");
+        Check(Math.Abs(meter.Rate(baseline+hz)-120)<0.01,"FPS selects a single swap chain at 120 FPS");
+        for(int i=1;i<=135;i++) meter.Add(100,baseline+hz+i*hz/30);
+        Check(Math.Abs(meter.Rate(baseline+hz*5+hz/2)-30)<0.01,"FPS tracks a change from 120 to 30 FPS");
+        Check(meter.Rate(baseline+hz*9)==0,"stale FPS expires");
+        var slow=new FrameSamples(7);slow.Add(1,hz);slow.Add(1,hz);slow.Add(1,hz*3);
+        Check(slow.Rate(hz*3)==0.5,"slow frames and duplicate timestamps");
+        var proof=new FpsLaunch(@"C:\Games\Example\Start.exe","Example",null);
+        Check(proof.Matches(@"C:\Games\Example\Bin\Binaries\Win64\Example-Shipping.exe","",0) &&
+            !proof.Matches(@"C:\Games\ExampleOther\Binaries\Win64\Other-Shipping.exe","",0),"renderer stays within the launched game directory");
+        CheckNativeFrames();
+        using(var control=new FpsSession(Guid.NewGuid().ToString("N"),true))
+        using(var worker=control.StartWorker(false)) {
+            control.TargetGame(0);
+            bool idle=System.Threading.SpinWait.SpinUntil(delegate {
+                int state;return control.Reading(out state)==0 && state==1;
+            },5000);
+            control.TargetGame(-1);
+            Check(worker.WaitForExit(4500) && idle,"FPS worker connects, acknowledges idle and exits when disabled");
+        }
         var overlay=new FpsHud();
         try {
             var handle=new System.Windows.Interop.WindowInteropHelper(overlay).EnsureHandle();
@@ -284,8 +313,10 @@ internal static class DiscoveryChecks {
     }
     [STAThread]
     static int Main(string[] args) {
+        if(args.Length>0 && args[0]=="--fps-session") {FpsSession.Worker(args);return 0;}
         try {
             if(args.Contains("--live-fps")) {FpsLiveCheck.Run();return 0;}
+            if(args.Contains("--replay-fps")) {FpsLiveCheck.Run(true);return 0;}
             if(args.Contains("--online-icons")) {
                 foreach(string title in new[]{"VALORANT","League of Legends","Teamfight Tactics","Fortnite","Bloons TD 6","A Plague Tale Requiem","LANESPLIT","Minecraft"}) {
                     var icon=GameArtwork.Get(title,null,true).GetAwaiter().GetResult();

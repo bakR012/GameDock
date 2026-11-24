@@ -61,7 +61,7 @@ partial class GameDock {
     async void OpenSelectedMinecraft() {
         var choice=minecraft;
         if(choice==null) return;
-        if(choice.IsShell) {Launch(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"explorer.exe"),"\""+choice.Target+"\""); return;}
+        if(choice.IsShell) {Launch(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),"explorer.exe"),"\""+choice.Target+"\"","Minecraft",choice.Target); return;}
         if(!File.Exists(choice.Target)) {
             Alert(T("تعذّر العثور على اللانشر المحفوظ. اختر موقعه الجديد.","The saved launcher could not be found. Choose its new location."));
             OpenMinecraftSettings(); return;
@@ -75,7 +75,7 @@ partial class GameDock {
             finally {resolvingProfile=false;}
             if(closing || choice!=minecraft) return;
         }
-        Launch(choice.Target,arguments);
+        Launch(choice.Target,arguments,"Minecraft",choice.Target);
     }
     void SetLauncher(MinecraftLauncher choice) {
         try {

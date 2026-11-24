@@ -20,7 +20,7 @@ using Forms = System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.10.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.11.0.0")]
 partial class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -271,8 +271,8 @@ partial class GameDock : Window {
         return brush;
     }
     static void Alert(string message) { MessageBox.Show(message, "GameDock"); }
-    void Launch(string path,string arguments = "") {
-        try { Process.Start(new ProcessStartInfo(path,arguments ?? "") { UseShellExecute = true, WorkingDirectory = File.Exists(path) ? Path.GetDirectoryName(path) : "" }); }
+    void Launch(string path,string arguments = "",string fpsTitle=null,string proof=null) {
+        try { using(var child=Process.Start(new ProcessStartInfo(path,arguments ?? "") { UseShellExecute = true, WorkingDirectory = File.Exists(path) ? Path.GetDirectoryName(path) : "" })) {if(fpsTitle!=null) host.RememberFpsLaunch(proof??path,fpsTitle,child);} }
         catch (Exception e) { Alert(T("تعذّر فتح العنصر.", "Could not open this item.") + "\n" + e.Message); }
     }
     const string OrderKey = prefs + @"\Order";
@@ -407,7 +407,7 @@ partial class GameDock : Window {
             Refresh();
         } catch (Exception e) { Alert(T("تعذّر إصلاح الاختصار.","Could not repair the shortcut.") + "\n" + e.Message); }
     }
-    void OpenEntry(string path) {
+    void OpenEntry(string path,ManualGame game,string title) {
         bool missing = false;
         if (Link(path)) {
             try { WithLink(path, delegate(dynamic link) {
@@ -416,7 +416,9 @@ partial class GameDock : Window {
             }); } catch (Exception) { /* Shell can still launch special shortcuts. */ }
         }
         if (!missing) {
-            try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); return; }
+            try { using(var child=Process.Start(new ProcessStartInfo(path) { UseShellExecute = true })) {
+                    if(game!=null && (FpsLaunchTarget(game.Target) || game.SteamId!=null)) host.RememberFpsLaunch(game.Target,title,child);
+                } return; }
             catch (Exception e) {
                 if (!Link(path) && !Url(path)) { Alert(e.Message); return; }
             }
@@ -1263,7 +1265,7 @@ partial class GameDock : Window {
             var content=GameVisual(game.Title,game.Icon,entry.StartsWith("steam-",StringComparison.Ordinal) ? entry.Substring(6) : null,entry=="prism-minecraft" ? game.Proof : null,game.ShortcutIcon,verifiedExe);
             var button=Tile(content,game.Title,delegate {
                 if(!GameScan.Ready(game)) {host.ScanGames();return;}
-                Launch(game.Target,game.LaunchArguments(host.lastMinecraftProfile));
+                Launch(game.Target,game.LaunchArguments(host.lastMinecraftProfile),game.Title,game.Proof);
             },true);
             EnableDrag(button,entry);
             Canvas.SetLeft(button,Side ? 0 : index*(double)Slot);
@@ -1280,7 +1282,7 @@ partial class GameDock : Window {
             var image=GetIcon(path);
             visual=image==null ? (object)new TextBlock {Text="?"} : new Image {Source=image,Width=32,Height=32};
         }
-        var tile=Tile(visual,title,delegate {OpenEntry(path);},true);
+        var tile=Tile(visual,title,delegate {OpenEntry(path,pin?host.pins.Item(entry):manual,title);},true);
         EnableDrag(tile,pin ? entry : path);
         Canvas.SetLeft(tile,Side ? 0 : index*(double)Slot);
         Canvas.SetTop(tile,Side ? index*(double)TileHeight : 0);
@@ -1346,6 +1348,7 @@ partial class GameDock : Window {
     [DllImport("shell32.dll",CharSet=CharSet.Unicode)]
     static extern void SHChangeNotify(int eventId,uint flags,string path,IntPtr unused);
     [STAThread] static void Main(string[] args) {
+        if(args.Length>0 && args[0]=="--fps-session") {FpsSession.Worker(args);return;}
         if (args.Contains("--refresh-icon"))
             SHChangeNotify(0x2000,0x0005,System.Reflection.Assembly.GetExecutingAssembly().Location,IntPtr.Zero);
         bool first;
