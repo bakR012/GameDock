@@ -78,7 +78,7 @@ internal static class GameArtwork {
     static byte[] Fetch(string url,int limit,bool prefix=false) {
         var request=(HttpWebRequest)WebRequest.Create(url);
         request.Timeout=5500; request.ReadWriteTimeout=5500; request.AllowAutoRedirect=false;
-        request.UserAgent="GameDock/1.9.0 (github.com/bakR012/GameDock)";
+        request.UserAgent="GameDock/1.10.0 (github.com/bakR012/GameDock)";
         request.AutomaticDecompression=DecompressionMethods.GZip | DecompressionMethods.Deflate;
         using(var response=(HttpWebResponse)request.GetResponse())
         using(var stream=response.GetResponseStream())

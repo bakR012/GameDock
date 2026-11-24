@@ -115,7 +115,7 @@ partial class GameDock {
             labels.Children.Add(new TextBlock {Text=T("اللانشر وخيارات التشغيل","Launcher and launch options")});
             content.Children.Add(labels); card.Content=content;
             System.Windows.Automation.AutomationProperties.SetName(card,T("إعدادات Minecraft","Minecraft settings"));
-            body.Children.Add(card); return;
+            body.Children.Add(card); DrawFpsSettings(body); return;
         }
         body.Children.Add(SettingButton(T("العودة إلى الألعاب","Back to games"),delegate {minecraftDetails=false;DrawSettings();},false));
         Detail(body,minecraft==null ? T("اللانشر الحالي · تلقائي","Current launcher · Automatic") : T("اللانشر الحالي · ","Current launcher · ")+minecraft.Name);

@@ -251,9 +251,41 @@ internal static class DiscoveryChecks {
             Check(String.Equals(saved.Target,launcherPath,StringComparison.OrdinalIgnoreCase) && saved.Arguments=="--launch pack","pin preserves a launcher's exact profile arguments");
         } finally {System.Runtime.InteropServices.Marshal.FinalReleaseComObject(shell);}
     }
+    static void FrameRates() {
+        var meter=new FrameSamples(42);
+        meter.Read("Application,ProcessID,SwapChainAddress,TimeInSeconds,MsBetweenPresents",0);
+        var culture=System.Globalization.CultureInfo.InvariantCulture;
+        long now=System.Diagnostics.Stopwatch.Frequency;
+        for(int i=0;i<=120;i++) {
+            string stamp=(i/120.0).ToString("F8",culture);
+            meter.Read("Main,Game.exe,42,0xAA,"+stamp+",8.33",now);
+            if(i%2==0) meter.Read("game.exe,42,0xBB,"+stamp+",16.67",now);
+            meter.Read("other.exe,77,0xCC,"+stamp+",0",now);
+        }
+        Check(Math.Abs(meter.Rate(now)-120)<0.01,"FPS reads the dominant swap chain without adding secondary presents");
+        for(int i=1;i<=60;i++)
+            meter.Read("game.exe,42,0xAA,"+(1+i/30.0).ToString("F8",culture)+",33.33",now*4);
+        Check(Math.Abs(meter.Rate(now*4)-30)<0.01,"FPS adapts to a frame rate change using presentation time");
+        Check(meter.Rate(now*7)==0,"FPS hides stale frames after a stall");
+        var other=new FrameSamples(7);
+        other.Read("Application,ProcessID,SwapChainAddress,TimeInSeconds",0);
+        foreach(string row in new[]{"bad","a,42,aa,3","a,42,aa,4","a,7,aa,NaN","a,7,aa,Infinity","a,7,aa,1","a,7,aa,1"})
+            other.Read(row,0);
+        Check(other.Rate(0)==0,"FPS ignores other processes, invalid times and duplicate timestamps");
+        other.Read("a,7,aa,3",now);
+        Check(other.Rate(now)==0.5,"FPS represents slow rendering without rounding it to zero");
+        var overlay=new FpsHud();
+        try {
+            var handle=new System.Windows.Interop.WindowInteropHelper(overlay).EnsureHandle();
+            int style=FpsWindows.Style(handle,-20);
+            Check(!overlay.ShowActivated && !overlay.ShowInTaskbar && !overlay.IsHitTestVisible &&
+                (style&0x080000a0)==0x080000a0 && (style&0x40000)==0,"FPS overlay passes clicks through and stays out of Alt+Tab");
+        } finally {overlay.Close();}
+    }
     [STAThread]
     static int Main(string[] args) {
         try {
+            if(args.Contains("--live-fps")) {FpsLiveCheck.Run();return 0;}
             if(args.Contains("--online-icons")) {
                 foreach(string title in new[]{"VALORANT","League of Legends","Teamfight Tactics","Fortnite","Bloons TD 6","A Plague Tale Requiem","LANESPLIT","Minecraft"}) {
                     var icon=GameArtwork.Get(title,null,true).GetAwaiter().GetResult();
@@ -261,7 +293,7 @@ internal static class DiscoveryChecks {
                 }
                 return 0;
             }
-            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons(); PersonalPins();
+            RiotAndShortcuts(); Minecraft(); ExternalGames(); StoreManifests(); Steam(); Icons(); PersonalPins(); FrameRates();
             const string release="{\"tag_name\":\"v1.10.0\",\"draft\":false,\"prerelease\":false}";
             Check(ProjectInfo.PublishedVersion(release)>new Version(1,9,0,0),"update check compares numeric versions");
             foreach(string invalid in new[]{release.Replace("false","true"),release.Replace("v1.10.0","v1.10.0-beta.1"),"{}"}) {

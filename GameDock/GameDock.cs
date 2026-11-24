@@ -20,7 +20,7 @@ using Forms = System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.9.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.10.0.0")]
 partial class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -329,6 +329,7 @@ partial class GameDock : Window {
                 if (!result.Retry || retryCount>=2 || detected.Games.Count==0) {
                     var previous=detected;
                     detected=result;
+                    FocusFps();
                     var list=Entries();
                     if(!entries.SequenceEqual(list,Paths) || list.Any(id=>{
                         if(DockPins.IsPin(id) || SelectedMinecraft(id)) return false;
@@ -1118,6 +1119,7 @@ partial class GameDock : Window {
         };
         Loaded += delegate {
             if (host != this) return;
+            if(fpsEnabled) StartFps();
             StartupUpdateCheck();
             try { if (File.Exists(settings)) folder = File.ReadAllText(settings); } catch (IOException) {}
             if (automatic) { Refresh(); ArrangeDisplays(); ScanGames(); return; }
@@ -1135,6 +1137,7 @@ partial class GameDock : Window {
         Closed += delegate {
             closing = true; ReleaseTray(); StopGameWatchers();
             if (host == this) {
+                StopFps();
                 SystemEvents.DisplaySettingsChanged -= DisplayChanged;
                 System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged-=NetworkChanged;
                 foreach (var mirror in mirrors.ToArray()) mirror.Close();
@@ -1306,6 +1309,7 @@ partial class GameDock : Window {
         bool failed = false;
         string[] list;
         try { list = Entries(); } catch (Exception) { list = new string[0]; failed = true; }
+        FocusFps();
         RenderEntries(list, failed);
         foreach (var dock in mirrors) { dock.folder = folder; dock.RenderEntries(list, failed); }
     }
