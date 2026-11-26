@@ -55,28 +55,68 @@ internal static class FpsWindows {
     }
     [StructLayout(LayoutKind.Sequential)] internal struct Point {internal int X,Y;}
     [StructLayout(LayoutKind.Sequential)] internal struct Rect {internal int Left,Top,Right,Bottom;}
+    [StructLayout(LayoutKind.Sequential)] struct MonitorInfo {internal int Size;internal Rect Bounds,Work;internal uint Flags;}
+    [DllImport("user32")] static extern IntPtr MonitorFromWindow(IntPtr window,uint flags);
+    [DllImport("user32",EntryPoint="GetMonitorInfoW")] static extern bool GetMonitorInfo(IntPtr monitor,ref MonitorInfo info);
+    [DllImport("user32")] static extern bool IsIconic(IntPtr window);
+    internal static bool VisibleClient(IntPtr window,out Rect viewport) {
+        var origin=new Point();viewport=new Rect();
+        if(window==IntPtr.Zero || IsIconic(window) || !GetClientRect(window,out viewport) ||
+            !ClientToScreen(window,ref origin)) return false;
+        viewport.Left+=origin.X;viewport.Right+=origin.X;viewport.Top+=origin.Y;viewport.Bottom+=origin.Y;
+        var info=new MonitorInfo {Size=Marshal.SizeOf(typeof(MonitorInfo))};
+        if(!GetMonitorInfo(MonitorFromWindow(window,0),ref info)) return false;
+        viewport.Left=Math.Max(viewport.Left,info.Bounds.Left);viewport.Top=Math.Max(viewport.Top,info.Bounds.Top);
+        viewport.Right=Math.Min(viewport.Right,info.Bounds.Right);viewport.Bottom=Math.Min(viewport.Bottom,info.Bounds.Bottom);
+        return viewport.Right-viewport.Left>=100 && viewport.Bottom-viewport.Top>=45;
+    }
     [DllImport("user32")] internal static extern bool ClientToScreen(IntPtr h,ref Point p);
     [DllImport("user32")] internal static extern bool GetClientRect(IntPtr h,out Rect r);
     [DllImport("user32")] internal static extern bool GetWindowRect(IntPtr h,out Rect r);
     [DllImport("user32",EntryPoint="GetWindowLongW")] internal static extern int Style(IntPtr h,int index);
     [DllImport("user32",EntryPoint="SetWindowLongW")] internal static extern int Style(IntPtr h,int index,int value);
     [DllImport("user32")] internal static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int w,int height,uint flags);
+    [DllImport("user32")] static extern IntPtr GetWindow(IntPtr window,uint command);
+    internal static bool IsAbove(IntPtr overlay,IntPtr game) {
+        // Walk toward the front of the Z order. Bound the walk because windows
+        // can disappear or be reordered while the display mode changes.
+        for(int i=0;i<128 && game!=IntPtr.Zero;i++) {
+            game=GetWindow(game,3); // GW_HWNDPREV
+            if(game==overlay) return true;
+        }
+        return false;
+    }
 }
 
 internal sealed class FpsLaunch {
     internal readonly string PathHint,Title;
     internal readonly int RootPid;
     internal readonly long Birth;
-    readonly string directory;
+    readonly string directory,gameRoot;
     internal FpsLaunch(string path,string title,Process root) {
         PathHint=path;Title=GameArtwork.Normalize(title);
         if(!String.IsNullOrEmpty(path) && Path.IsPathRooted(path) && path.EndsWith(".exe",StringComparison.OrdinalIgnoreCase) &&
-            !GameScan.IsLauncher(path)) directory=Path.GetDirectoryName(path);
+            !GameScan.IsLauncher(path)) {
+            directory=Path.GetDirectoryName(path);
+            gameRoot=InstallRoot(directory,Title);
+        }
         if(root!=null) try {RootPid=root.Id;Birth=root.StartTime.ToUniversalTime().Ticks;} catch(Exception) {}
+    }
+    static string InstallRoot(string directory,string title) {
+        if(String.IsNullOrEmpty(directory)) return null;
+        // Steam's per-game directory is authoritative even when the store title
+        // and executable names differ. Stop at the common library boundary.
+        for(var d=new DirectoryInfo(directory);d.Parent!=null;d=d.Parent) {
+            if(d.Parent.Name.Equals("common",StringComparison.OrdinalIgnoreCase) && d.Parent.Parent!=null &&
+                d.Parent.Parent.Name.Equals("steamapps",StringComparison.OrdinalIgnoreCase)) return d.FullName;
+            if(title.Length>=3 && GameArtwork.Normalize(d.Name)==title) return d.FullName;
+        }
+        return null;
     }
     internal bool Matches(string path,string title,int pid,Lazy<Dictionary<uint,uint>> ancestry=null) {
         if(String.Equals(path,PathHint,StringComparison.OrdinalIgnoreCase)) return true;
         if(Title.Length>=3 && (GameArtwork.Normalize(title)==Title || GameArtwork.Normalize(Path.GetFileNameWithoutExtension(path))==Title)) return true;
+        if(gameRoot!=null && path.StartsWith(gameRoot+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase)) return true;
         if(!String.IsNullOrEmpty(directory) && path.StartsWith(directory+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase) &&
             path.IndexOf(@"\Binaries\",directory.Length,StringComparison.OrdinalIgnoreCase)>=0 &&
             path.EndsWith("-Shipping.exe",StringComparison.OrdinalIgnoreCase)) return true;
@@ -121,25 +161,42 @@ partial class GameDock {
     FpsWindows.FocusEvent fpsCallback;
     IntPtr fpsHook,fpsWindow;
     int fpsPid;
+    int lastGamePid;
+    long lastGameBirth;
+    int rejectedPid;
+    IntPtr rejectedWindow;
+    string rejectedTitle;
+    long rejectedUntil;
     long fpsOpened;
+    long focusLostAt;
     string fpsFailure;
     FpsHud fpsHud;
     DispatcherTimer fpsTimer;
+    bool fpsFocusQueued;
+    long fpsRetryWorkerAt;
+    int fpsWorkerFailures;
+    static readonly TimeSpan FpsActiveInterval=TimeSpan.FromMilliseconds(450);
+    static readonly TimeSpan FpsIdleInterval=TimeSpan.FromSeconds(2);
     FpsSession fpsSession;
     Process fpsProcess;
     bool fpsStarting,fpsDeclined,fpsForceConsent;
     int fpsEpoch;
     void StartFps() {
         if(fpsTimer!=null) return;
-        fpsTimer=new DispatcherTimer {Interval=TimeSpan.FromMilliseconds(500)};
-        fpsTimer.Tick+=PaintFps;
-        fpsCallback=delegate {if(!closing && fpsEnabled) FocusFps();};
+        fpsTimer=new DispatcherTimer {Interval=FpsIdleInterval};
+        fpsTimer.Tick+=delegate {FocusFps();};
+        fpsCallback=delegate {
+            if(closing || !fpsEnabled || fpsFocusQueued) return;
+            fpsFocusQueued=true;
+            Dispatcher.BeginInvoke(new Action(delegate {fpsFocusQueued=false;FocusFps();}));
+        };
         fpsHook=FpsWindows.SetWinEventHook(3,3,IntPtr.Zero,fpsCallback,0,0,0);
-        if(fpsHook==IntPtr.Zero) {fpsFailure=T("تعذّر تتبّع نافذة اللعبة.","Windows could not track the foreground game.");return;}
+        fpsTimer.Start();
         FocusFps();
     }
     async void PrepareFps(bool interactive) {
-        if(!fpsEnabled || closing || fpsStarting || fpsSession!=null || fpsDeclined) return;
+        if(!fpsEnabled || closing || fpsStarting || fpsSession!=null || fpsDeclined ||
+            (!interactive && Stopwatch.GetTimestamp()<fpsRetryWorkerAt)) return;
         bool elevate=fpsForceConsent || FpsSession.NeedsConsent();
         if(elevate && !interactive) return;
         fpsStarting=true;int epoch=fpsEpoch;FpsSession channel=null;
@@ -149,16 +206,20 @@ partial class GameDock {
             if(worker==null) throw new IOException();
             if(!fpsEnabled || closing || epoch!=fpsEpoch) {channel.TargetGame(-1);worker.Dispose();return;}
             fpsSession=channel;channel=null;fpsProcess=worker;
-            fpsProcess.Exited+=delegate {Dispatcher.BeginInvoke(new Action(delegate {
+            fpsProcess.Exited+=delegate {if(!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(new Action(delegate {
                 if(fpsProcess!=worker || !fpsEnabled || closing) return;
                 fpsFailure=T("توقف عدّاد FPS. أطفئ الخيار وفعّله لإعادة المحاولة.","FPS stopped. Switch it off and on to retry.");
-                CloseFpsSession();fpsDeclined=true;RefreshFpsSettings();
+                CloseFpsSession();DelayWorkerRetry();RefreshFpsSettings();
             }));};
-            fpsProcess.EnableRaisingEvents=true;
-            FocusFps(); fpsSession.TargetGame(fpsPid);
-        } catch(Exception) {
+            fpsSession.TargetGame(fpsPid);
+            try {fpsProcess.EnableRaisingEvents=true;} catch(System.ComponentModel.Win32Exception) { /* IPC heartbeat still monitors the worker. */ }
+            FocusFps();
+        } catch(Exception err) {
             if(!closing && fpsEnabled && epoch==fpsEpoch) {
-                fpsDeclined=true;fpsFailure=T("يحتاج العدّاد إذن قياس الأداء من ويندوز. أطفئ الخيار وفعّله لإعادة المحاولة.","Windows performance access is required. Switch FPS off and on to try again.");
+                var win=err as System.ComponentModel.Win32Exception;
+                fpsDeclined=win!=null && (win.NativeErrorCode==1223 || win.NativeErrorCode==5);
+                if(!fpsDeclined) DelayWorkerRetry();
+                fpsFailure=T("تعذّر بدء القياس في هذه الجلسة.","Could not start performance measurement in this session.");
                 RefreshFpsSettings();
             }
         } finally {
@@ -166,19 +227,22 @@ partial class GameDock {
             if(!closing && fpsEnabled && epoch!=fpsEpoch) PrepareFps(true);
         }
     }
+    void DelayWorkerRetry() {
+        fpsWorkerFailures=Math.Min(fpsWorkerFailures+1,4);
+        fpsRetryWorkerAt=Stopwatch.GetTimestamp()+(1L<<fpsWorkerFailures)*Stopwatch.Frequency;
+    }
     void RefreshFpsSettings() {if(settingsWindow!=null && settingsPage==2 && !minecraftDetails) DrawSettings();}
     void RememberFpsLaunch(string path,string title,Process root) {
         if(!fpsEnabled || closing) return;
+        rejectedUntil=0;
         fpsLaunches.RemoveAll(l=>Paths.Equals(l.PathHint,path) && l.Title==GameArtwork.Normalize(title));
         fpsLaunches.Insert(0,new FpsLaunch(path,title,root));
         if(fpsLaunches.Count>12) fpsLaunches.RemoveAt(12);
         PrepareFps(true);FocusFps();
     }
     static bool FpsLaunchTarget(string target) {return !String.IsNullOrEmpty(target) && (target.EndsWith(".exe",StringComparison.OrdinalIgnoreCase) || target.StartsWith("steam://",StringComparison.OrdinalIgnoreCase) || target.StartsWith("com.epicgames.launcher:",StringComparison.OrdinalIgnoreCase) || target.StartsWith("uplay:",StringComparison.OrdinalIgnoreCase));}
-    bool FpsGame(int pid,IntPtr window) {
+    bool FpsGame(int pid,string title) {
         var path=FpsWindows.ImagePath(pid);
-        var name=new StringBuilder(256);FpsWindows.GetWindowText(window,name,name.Capacity);
-        string title=name.ToString();
         if(String.IsNullOrEmpty(path)) {
             string key=GameArtwork.Normalize(title);
             return key.Length>=3 && (fpsLaunches.Any(l=>l.Title==key) || detected.Games.Values.Any(g=>GameArtwork.Normalize(g.Title)==key));
@@ -193,32 +257,58 @@ partial class GameDock {
         var ancestry=new Lazy<Dictionary<uint,uint>>(FpsLaunch.Parents);
         return fpsLaunches.Any(l=>l.Matches(path,title,pid,ancestry));
     }
+    bool RecognizeWindow(int pid,IntPtr window) {
+        var name=new StringBuilder(256);FpsWindows.GetWindowText(window,name,name.Capacity);
+        string title=name.ToString();long now=Stopwatch.GetTimestamp();
+        if(now<rejectedUntil && pid==rejectedPid && window==rejectedWindow && title==rejectedTitle) return false;
+        if(FpsGame(pid,title)) {rejectedUntil=0;return true;}
+        rejectedPid=pid;rejectedWindow=window;rejectedTitle=title;rejectedUntil=now+10*Stopwatch.Frequency;
+        return false;
+    }
     static readonly HashSet<string> NonGameProcesses=new HashSet<string>(new[]{"explorer","chrome","msedge","brave","firefox","discord","steamwebhelper","msedgewebview2","riotclientux","leagueclientux","gamebar"},StringComparer.OrdinalIgnoreCase);
+    static long ProcessBirth(int pid) {
+        try {using(var p=Process.GetProcessById(pid)) return p.StartTime.ToUniversalTime().Ticks;}
+        catch(ArgumentException) {} catch(InvalidOperationException) {} catch(System.ComponentModel.Win32Exception) {}
+        return 0;
+    }
     void FocusFps() {
         if(fpsTimer==null || !fpsEnabled || closing) return;
         var window=FpsWindows.GetForegroundWindow();int pid=FpsWindows.RenderingPid(window);
-        if(pid!=0 && pid==fpsPid) {fpsWindow=window;return;}
-        if(pid!=0 && !FpsGame(pid,window)) pid=0;
-        if(pid==fpsPid) return;
-        fpsPid=pid;fpsWindow=window;fpsOpened=Stopwatch.GetTimestamp();
-        if(fpsHud!=null) fpsHud.Hide();
-        if(fpsSession!=null) fpsSession.TargetGame(pid);
-        if(pid==0) {fpsTimer.Stop();return;}
-        PrepareFps(false);fpsTimer.Start();PaintFps(null,EventArgs.Empty);
+        if(pid!=0 && pid!=fpsPid &&
+            !(pid==lastGamePid && lastGameBirth!=0 && ProcessBirth(pid)==lastGameBirth)) {
+            if(RecognizeWindow(pid,window)) {lastGamePid=pid;lastGameBirth=ProcessBirth(pid);}
+            else pid=0;
+        }
+        // Windows can briefly clear the foreground during a swap-chain or HWND
+        // replacement. Hide immediately but keep the existing capture warm.
+        if(pid==0 && fpsPid!=0) {
+            if(fpsHud!=null && fpsHud.IsVisible) fpsHud.Hide();
+            long now=Stopwatch.GetTimestamp();
+            if(focusLostAt==0) focusLostAt=now;
+            if(now-focusLostAt<Stopwatch.Frequency) return;
+        }
+        focusLostAt=0;fpsWindow=window;
+        if(pid!=fpsPid) {
+            fpsPid=pid;fpsOpened=Stopwatch.GetTimestamp();
+            if(fpsSession!=null) fpsSession.TargetGame(pid);
+            fpsTimer.Interval=pid==0?FpsIdleInterval:FpsActiveInterval;
+        }
+        if(pid==0) {if(fpsHud!=null && fpsHud.IsVisible) fpsHud.Hide();return;}
+        PrepareFps(false);PaintFps();
     }
-    void PaintFps(object sender,EventArgs e) {
-        if(fpsPid==0 || closing) return;
-        if(fpsWindow!=FpsWindows.GetForegroundWindow()) {FocusFps();return;}
+    void PaintFps() {
         int state=0;double rate=fpsSession==null?0:fpsSession.Reading(out state);
-        if(state==-3 && fpsSession!=null) {fpsSession.TargetGame(fpsPid);return;}
         if(state==-2) fpsForceConsent=true;
-        if(state<0) fpsFailure=state==-2?T("أطفئ خيار FPS وفعّله ثم وافق على إذن ويندوز للقياس.","Switch FPS off and on, then allow Windows performance access."):
-            T("تعذّر بدء القياس في ويندوز. أطفئ الخيار وفعّله للمحاولة مجددًا.","Windows could not start capture. Switch FPS off and on to retry.");
-        else if(rate>0) fpsFailure=null;
+        if(state==-4) {CloseFpsSession();DelayWorkerRetry();}
+        if(state==-2) fpsFailure=T("أطفئ خيار FPS وفعّله ثم وافق على إذن ويندوز للقياس.","Switch FPS off and on, then allow Windows performance access.");
+        else if(state==-3) fpsFailure=null;
+        else if(state==-1) fpsFailure=T("انقطع قياس الإطارات. يعيد GameDock المحاولة تلقائيًا.","Frame capture was interrupted. GameDock is retrying.");
+        else if(state==-4) fpsFailure=T("توقف قياس الإطارات. أعد فتح اللعبة من الدوك إذا احتاج ويندوز إذنًا جديدًا.","Frame capture stopped. Relaunch from the dock if Windows needs permission again.");
+        else if(rate>0) {fpsFailure=null;fpsWorkerFailures=0;fpsRetryWorkerAt=0;}
         else if(state==1 && Stopwatch.GetTimestamp()-fpsOpened>6*Stopwatch.Frequency)
-            fpsFailure=T("لم تصل إطارات من نافذة اللعبة. جرّب وضع ملء الشاشة بلا حدود.","No frames received from this window. Try borderless fullscreen.");
+            fpsFailure=T("لم تصل إطارات من اللعبة بعد. يتابع العداد انتظار إطارات جديدة.","No frames received from the game yet. The counter is still listening.");
         if(fpsHud==null) fpsHud=new FpsHud();
-        fpsHud.Display(fpsWindow,rate,fpsCorner==1);
+        fpsHud.Display(fpsWindow,FpsWindows.GetForegroundWindow(),rate,fpsCorner==1);
     }
     void CloseFpsSession() {
         if(fpsSession!=null) {fpsSession.TargetGame(-1);fpsSession.Dispose();fpsSession=null;}
@@ -226,8 +316,9 @@ partial class GameDock {
     }
     void StopFps() {
         fpsEpoch++;
+        fpsRetryWorkerAt=0;fpsWorkerFailures=0;
         if(fpsHook!=IntPtr.Zero) FpsWindows.UnhookWinEvent(fpsHook);
-        fpsHook=IntPtr.Zero;fpsCallback=null;fpsPid=0;fpsLaunches.Clear();
+        fpsHook=IntPtr.Zero;fpsCallback=null;fpsPid=0;lastGamePid=0;lastGameBirth=0;focusLostAt=0;fpsLaunches.Clear();
         if(fpsTimer!=null) {fpsTimer.Stop();fpsTimer=null;}
         if(fpsHud!=null) {fpsHud.Close();fpsHud=null;}
         CloseFpsSession();
@@ -239,13 +330,15 @@ partial class GameDock {
             DrawSettings();
         });
         if(!fpsEnabled) return;
-        Detail(body,fpsFailure ?? T("افتح لعبتك من الدوك بوضع النافذة أو ملء الشاشة بلا حدود. إذا طلب ويندوز إذن القياس، وافق لهذه الجلسة.","Launch a windowed or borderless game from the dock. If Windows asks, allow performance measurement for this session."));
+        Detail(body,fpsFailure ?? T("يظهر العداد فوق الألعاب في وضع النافذة أو ملء الشاشة بلا حدود. قد يخفيه وضع ملء الشاشة الحصري. إذا طلب ويندوز إذن القياس، وافق لهذه الجلسة.","Shows FPS in windowed and borderless fullscreen games. Exclusive fullscreen can hide the counter. If Windows asks, allow performance measurement for this session."));
         Section(body,T("مكان العدّاد","Counter position"),new[]{T("أعلى اليسار","Top left"),T("أعلى اليمين","Top right")},fpsCorner,
             delegate(int i){fpsCorner=i;SavePreference("FpsCorner",i);});
     }
 }
 
 internal sealed class FpsHud : Window {
+    IntPtr lastWindow;
+    FpsWindows.Rect lastViewport;
     readonly TextBlock number=new TextBlock {FontSize=17,FontWeight=FontWeights.SemiBold,Foreground=Brushes.White,VerticalAlignment=VerticalAlignment.Center};
     internal FpsHud() {
         Title="GameDock FPS"; WindowStyle=WindowStyle.None; AllowsTransparency=true;
@@ -263,17 +356,21 @@ internal sealed class FpsHud : Window {
             FpsWindows.Style(h,-20,(FpsWindows.Style(h,-20)&~0x40000)|0x08000000|0x80|0x20);
         };
     }
-    internal void Display(IntPtr game,double rate,bool right) {
-        FpsWindows.Rect client,outer; var origin=new FpsWindows.Point();
-        if(game!=FpsWindows.GetForegroundWindow() || !FpsWindows.GetClientRect(game,out client) ||
-            !FpsWindows.ClientToScreen(game,ref origin) || client.Right<100 || client.Bottom<45) {Hide();return;}
+    internal void Display(IntPtr game,IntPtr foreground,double rate,bool right) {
+        FpsWindows.Rect viewport,outer;
+        if(game!=foreground || !FpsWindows.VisibleClient(game,out viewport)) {if(IsVisible) Hide();return;}
         number.Text=rate<=0?"—":rate<1?rate.ToString("0.0",CultureInfo.InvariantCulture):Math.Round(rate).ToString(CultureInfo.InvariantCulture);
         if(!IsVisible) {Opacity=0;Show();}
         var handle=new WindowInteropHelper(this).Handle;
         if(!FpsWindows.GetWindowRect(handle,out outer)) {Hide();return;}
-        int x=origin.X+(right?client.Right-(outer.Right-outer.Left)-12:12), y=origin.Y+12;
-        if(x!=outer.Left || y!=outer.Top || Opacity==0)
-            FpsWindows.SetWindowPos(handle,new IntPtr(-1),x,y,0,0,0x11);
+        int x=right?Math.Max(viewport.Left,viewport.Right-(outer.Right-outer.Left)-12):viewport.Left+12;
+        int y=viewport.Top+12;
+        if(x!=outer.Left || y!=outer.Top || Opacity==0 || lastWindow!=game ||
+            lastViewport.Left!=viewport.Left || lastViewport.Right!=viewport.Right ||
+            lastViewport.Top!=viewport.Top || lastViewport.Bottom!=viewport.Bottom || !FpsWindows.IsAbove(handle,game)) {
+            if(!FpsWindows.SetWindowPos(handle,new IntPtr(-1),x,y,0,0,0x11)) return;
+            lastWindow=game;lastViewport=viewport;
+        }
         Opacity=1;
     }
 }

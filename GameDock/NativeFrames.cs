@@ -27,15 +27,25 @@ internal sealed class FrameSamples {
     }
     internal double Rate(long now) {
         lock(chains) {
+            long newest=0;
+            foreach(var c in chains.Values) if(c.Frames.Count>=2) newest=Math.Max(newest,c.Last);
             Chain best=null;
             foreach(var c in chains.Values)
-                if(c.Frames.Count>=2 && now-c.Last<=3*Stopwatch.Frequency && (best==null || best.Frames.Count<c.Frames.Count)) best=c;
+                if(c.Frames.Count>=2 && now-c.Last<=3*Stopwatch.Frequency && newest-c.Last<=Stopwatch.Frequency/4 &&
+                    (best==null || best.Frames.Count<c.Frames.Count)) best=c;
             return best==null?0:(best.Frames.Count-1)*(double)Stopwatch.Frequency/(best.Last-best.Frames.Peek());
         }
     }
 }
 
-internal sealed partial class NativeFrames {
+internal interface IFpsCapture {
+    double Rate(long now);
+    void Run(CancellationToken token);
+}
+
+internal sealed partial class NativeFrames : IFpsCapture {
+    double IFpsCapture.Rate(long now) {return Rate(now);}
+    void IFpsCapture.Run(CancellationToken token) {Run(token);}
     static readonly Guid Dxgi=new Guid("ca11c036-0102-4a2d-a6ad-f03cfed5d3c9");
     static readonly Guid D3d9=new Guid("783aca0a-790e-4d7f-8451-aa850511c6b9");
     static readonly Guid KernelGraphics=new Guid("802ec45a-1e99-4b83-9920-87c98277ba9d");
@@ -80,7 +90,7 @@ internal sealed partial class NativeFrames {
     readonly FrameSamples runtime,kernel;
     readonly Dictionary<long,long> pending=new Dictionary<long,long>();
     long lastRuntime;
-    IntPtr windowProperty,statusProperty;
+    IntPtr windowProperty,statusProperty,contextProperty;
     internal NativeFrames(int pid) {runtime=new FrameSamples(pid);kernel=new FrameSamples(pid);}
     internal double Rate(long now) {double result=runtime.Rate(now);return result>0?result:kernel.Rate(now);}
     internal void Accept(ref Record r) {
@@ -108,8 +118,15 @@ internal sealed partial class NativeFrames {
             var status=new PropertyName {Name=statusProperty.ToInt64(),Index=UInt32.MaxValue};
             long window,result;
             if(TdhGetProperty(ref r,0,IntPtr.Zero,1,ref status,4,out result)==0 && (int)result!=0) return;
-            if(TdhGetProperty(ref r,0,IntPtr.Zero,1,ref name,8,out window)==0 && window!=0)
-                kernel.Add(window,r.Stamp);
+            if(TdhGetProperty(ref r,0,IntPtr.Zero,1,ref name,8,out window)==0 && window!=0) kernel.Add(window,r.Stamp);
+            else {
+                // Some kernel presents have no desktop HWND. Separate their
+                // graphics contexts instead of merging unrelated render loops.
+                var context=new PropertyName {Name=contextProperty.ToInt64(),Index=UInt32.MaxValue};
+                long id;
+                if(TdhGetProperty(ref r,0,IntPtr.Zero,1,ref context,4,out id)==0 && (uint)id!=0)
+                    kernel.Add(~(long)(uint)id,r.Stamp);
+            }
         }
     }
     static uint Enable(ulong session,Guid provider,int pid,ushort[] ids,ulong keywords) {
@@ -150,6 +167,7 @@ internal sealed partial class NativeFrames {
             session=handle;
             windowProperty=Marshal.StringToHGlobalUni("hWindow");
             statusProperty=Marshal.StringToHGlobalUni("ReturnStatus");
+            contextProperty=Marshal.StringToHGlobalUni("hContext");
             var log=new Log {Name=namePtr,Mode=0x100|0x10000000|0x1000,RecordCallback=Marshal.GetFunctionPointerForDelegate(callback)};
             consumer=OpenTrace(ref log);
             if(consumer==UInt64.MaxValue || consumer==UInt32.MaxValue) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -167,6 +185,7 @@ internal sealed partial class NativeFrames {
             if(consumer!=UInt64.MaxValue && consumer!=UInt32.MaxValue) CloseTrace(consumer);
             if(windowProperty!=IntPtr.Zero) Marshal.FreeHGlobal(windowProperty);
             if(statusProperty!=IntPtr.Zero) Marshal.FreeHGlobal(statusProperty);
+            if(contextProperty!=IntPtr.Zero) Marshal.FreeHGlobal(contextProperty);
             windowProperty=IntPtr.Zero; Marshal.FreeHGlobal(props);Marshal.FreeHGlobal(namePtr);GC.KeepAlive(callback);
         }
     }

@@ -14,8 +14,8 @@ using D = System.Drawing;
 [assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyVersion("1.11.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.11.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.11.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.11.2.0")]
 
 internal sealed class Distribution : F.Form {
     const string Arp = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\GameDock";
@@ -191,7 +191,7 @@ internal sealed class Distribution : F.Form {
             else if(Equal(run,Quote(exe)) || Equal(run,Quote(OldExe))) tx.Value(RunSub,"GameDock",null);
             tx.Value(InstallSub,"Path",target);
             tx.Value(Arp,"DisplayName","GameDock");
-            tx.Value(Arp,"DisplayVersion","1.11.0");
+            tx.Value(Arp,"DisplayVersion","1.11.2");
             tx.Value(Arp,"Publisher","bakR"); tx.Value(Arp,"InstallLocation",target);
             tx.Value(Arp,"DisplayIcon",Quote(exe)+",0");
             tx.Value(Arp,"NoModify",1); tx.Value(Arp,"NoRepair",1);

@@ -19,6 +19,7 @@ internal sealed class FpsSession : IDisposable {
     readonly Mutex gate;
     readonly EventWaitHandle changed;
     int requested;
+    long requestedAt;
     static string Name(string id) {return @"Local\GameDockFPS-"+id;}
     static void Access(ObjectSecurity acl) {
         foreach(var sid in new[]{WindowsIdentity.GetCurrent().User,new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid,null)}) {
@@ -48,15 +49,18 @@ internal sealed class FpsSession : IDisposable {
     void Lock() {try {gate.WaitOne();} catch(AbandonedMutexException) {}}
     internal void TargetGame(int pid) {
         Lock();
-        try {values.Write(Target,pid);values.Write(Generation,++requested);} finally {gate.ReleaseMutex();}
+        try {values.Write(Target,pid);values.Write(Generation,++requested);requestedAt=Stopwatch.GetTimestamp();} finally {gate.ReleaseMutex();}
         changed.Set();
     }
     internal double Reading(out int state) {
         Lock();
         try {
-            if(values.ReadInt32(Reply)!=requested) {state=0;return 0;}
+            long now=Stopwatch.GetTimestamp();
+            if(values.ReadInt32(Reply)!=requested) {state=now-requestedAt>12*Stopwatch.Frequency?-4:0;return 0;}
             state=values.ReadInt32(Status);
-            return Stopwatch.GetTimestamp()-values.ReadInt64(24)>3*Stopwatch.Frequency?0:values.ReadDouble(Rate);
+            long age=now-values.ReadInt64(24);
+            if(state!=-2 && values.ReadInt32(Target)>0 && age>12*Stopwatch.Frequency) state=-4;
+            return age>3*Stopwatch.Frequency?0:values.ReadDouble(Rate);
         } finally {gate.ReleaseMutex();}
     }
     void Publish(int generation,int state,double rate) {
@@ -96,7 +100,11 @@ internal sealed class FpsSession : IDisposable {
         } catch(Exception) { /* Parent closed or Windows refused access. */ }
     }
     void Serve(WaitHandle exit) {
-        int current=-1;NativeFrames meter=null;CancellationTokenSource stop=null;Task capture=null;
+        Serve(exit,()=>FpsWindows.RenderingPid(FpsWindows.GetForegroundWindow()),pid=>new NativeFrames(pid));
+    }
+    internal void Serve(WaitHandle exit,Func<int> foreground,Func<int,IFpsCapture> create) {
+        int current=-1,state=0,failures=0;long retryAt=0;
+        IFpsCapture meter=null;CancellationTokenSource stop=null;Task capture=null;
         var waits=new[]{exit,changed};
         try {
             for(;;) {
@@ -105,21 +113,27 @@ internal sealed class FpsSession : IDisposable {
                 if(pid<0 || exit.WaitOne(0)) break;
                 if(current!=generation) {
                     Finish(ref stop,ref capture);meter=null;current=generation;
-                    int foreground=FpsWindows.RenderingPid(FpsWindows.GetForegroundWindow());
-                    if(pid>0 && pid==foreground) {
-                        meter=new NativeFrames(pid);stop=new CancellationTokenSource();
-                        var token=stop.Token;var active=meter;
-                        capture=Task.Run(()=>active.Run(token));
-                    }
+                    state=1;failures=0;retryAt=0;
                 }
-                int state=pid>0 && meter==null?-3:1;double rate=0;
+                long now=Stopwatch.GetTimestamp();
                 if(capture!=null && capture.IsCompleted) {
                     var ex=capture.IsFaulted?capture.Exception.GetBaseException() as Win32Exception:null;
                     state=ex!=null && ex.NativeErrorCode==5?-2:-1;
-                    Finish(ref stop,ref capture);
-                } else if(meter!=null) rate=meter.Rate(Stopwatch.GetTimestamp());
+                    Finish(ref stop,ref capture);meter=null;
+                    failures=Math.Min(4,failures+1);
+                    retryAt=now+(1L<<failures)*Stopwatch.Frequency;
+                }
+                if(pid>0 && meter==null && state!=-2 && now>=retryAt) {
+                    if(foreground()==pid) {
+                        meter=create(pid);stop=new CancellationTokenSource();
+                        var token=stop.Token;var active=meter;
+                        capture=Task.Run(()=>active.Run(token));state=1;
+                    } else state=-3;
+                }
+                double rate=meter==null?0:meter.Rate(now);
+                if(rate>0) failures=0;
                 Publish(current,state,rate);
-                if(WaitHandle.WaitAny(waits,capture==null?Timeout.Infinite:450)==0) break;
+                if(WaitHandle.WaitAny(waits,pid==0 || state==-2?Timeout.Infinite:450)==0) break;
             }
         } finally {Finish(ref stop,ref capture);}
     }

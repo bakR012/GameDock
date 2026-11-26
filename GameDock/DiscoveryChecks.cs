@@ -288,12 +288,17 @@ internal static class DiscoveryChecks {
         for(int i=1;i<=135;i++) meter.Add(100,baseline+hz+i*hz/30);
         Check(Math.Abs(meter.Rate(baseline+hz*5+hz/2)-30)<0.01,"FPS tracks a change from 120 to 30 FPS");
         Check(meter.Rate(baseline+hz*9)==0,"stale FPS expires");
+        var transition=new FrameSamples(42);
+        for(int i=0;i<=144;i++) transition.Add(41,baseline+i*hz/144);
+        for(int i=1;i<=20;i++) transition.Add(42,baseline+hz+i*hz/40);
+        Check(Math.Abs(transition.Rate(baseline+hz+hz/2)-40)<0.01,"fullscreen replacement swap chain supersedes the retired 144 FPS chain");
         var slow=new FrameSamples(7);slow.Add(1,hz);slow.Add(1,hz);slow.Add(1,hz*3);
         Check(slow.Rate(hz*3)==0.5,"slow frames and duplicate timestamps");
         var proof=new FpsLaunch(@"C:\Games\Example\Start.exe","Example",null);
         Check(proof.Matches(@"C:\Games\Example\Bin\Binaries\Win64\Example-Shipping.exe","",0) &&
             !proof.Matches(@"C:\Games\ExampleOther\Binaries\Win64\Other-Shipping.exe","",0),"renderer stays within the launched game directory");
         CheckNativeFrames();
+        FpsLiveCheck.Recovery();
         using(var control=new FpsSession(Guid.NewGuid().ToString("N"),true))
         using(var worker=control.StartWorker(false)) {
             control.TargetGame(0);
