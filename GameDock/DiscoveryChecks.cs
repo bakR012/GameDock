@@ -299,8 +299,9 @@ internal static class DiscoveryChecks {
             !proof.Matches(@"C:\Games\ExampleOther\Binaries\Win64\Other-Shipping.exe","",0),"renderer stays within the launched game directory");
         CheckNativeFrames();
         FpsLiveCheck.Recovery();
+        FpsLiveCheck.BrokerChannel();
         using(var control=new FpsSession(Guid.NewGuid().ToString("N"),true))
-        using(var worker=control.StartWorker(false)) {
+        using(var worker=control.StartWorker()) {
             control.TargetGame(0);
             bool idle=System.Threading.SpinWait.SpinUntil(delegate {
                 int state;return control.Reading(out state)==0 && state==1;

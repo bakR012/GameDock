@@ -14,8 +14,8 @@ using D = System.Drawing;
 [assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyVersion("1.11.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.11.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.12.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.12.0.0")]
 
 internal sealed class Distribution : F.Form {
     const string Arp = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\GameDock";
@@ -47,6 +47,8 @@ internal sealed class Distribution : F.Form {
         try {
             if(args.Contains("--uninstall")) { BeginRemove(); return; }
             if(args.Length==2 && args[0]=="--finish-remove") { FinishRemove(args[1]); return; }
+            if(args.Length==1 && args[0]=="--remove-fps") {Environment.ExitCode=FpsSetup.Configure(true);return;}
+            if(args.Length==4 && args[0]=="--update") {ApplyUpdate(args);return;}
             bool first;
             using(var gate=new Mutex(true,@"Local\GameDock.Setup",out first)) {
                 if(first) F.Application.Run(new Distribution());
@@ -111,6 +113,63 @@ internal sealed class Distribution : F.Form {
         string value=Registry.GetValue(InstallKey,"Path","") as string;
         return String.IsNullOrEmpty(value) ? "" : Path.GetFullPath(value).TrimEnd('\\');
     }
+    static void ApplyUpdate(string[] args) {
+        int pid;long birth;Guid token;
+        if(!Int32.TryParse(args[1],out pid) || !Int64.TryParse(args[2],out birth) || !Guid.TryParseExact(args[3],"N",out token)) return;
+        string dir=ReadPath();if(String.IsNullOrEmpty(dir)) return;
+        string exe=Exe(dir),key=@"Local\GameDock.Update."+token.ToString("N");
+        bool first,accepted=false;
+        using(var gate=new Mutex(true,@"Local\GameDock.Setup",out first)) {
+            if(!first) return;
+            try {
+                using(var parent=Process.GetProcessById(pid))
+                using(var prepared=EventWaitHandle.OpenExisting(key+".prepared"))
+                using(var loaded=new EventWaitHandle(false,EventResetMode.ManualReset,key+".loaded")) {
+                    if(parent.StartTime.ToUniversalTime().Ticks!=birth || !Equal(parent.MainModule.FileName,exe) ||
+                        new Version(FileVersionInfo.GetVersionInfo(Self).FileVersion)<=new Version(FileVersionInfo.GetVersionInfo(exe).FileVersion)) return;
+                    string payload=Path.Combine(dir,Guid.NewGuid().ToString("N")+".tmp");
+                    try {
+                        using(var input=typeof(Distribution).Assembly.GetManifestResourceStream("GameDock.exe"))
+                        using(var output=new FileStream(payload,FileMode.CreateNew,FileAccess.Write,FileShare.None)) input.CopyTo(output);
+                        prepared.Set();
+                        if(!parent.WaitForExit(20000) || Running()) return;
+                        accepted=true;
+                        ReplaceAndLaunch(dir,payload,Self,token,loaded,delegate(Changes tx) {
+                            tx.Value(Arp,"DisplayVersion",new Version(FileVersionInfo.GetVersionInfo(Self).FileVersion).ToString(3));
+                        });
+                    } finally {if(File.Exists(payload)) File.Delete(payload);}
+                }
+            } catch(Exception) {
+                if(accepted && !Running()) {
+                    Process.Start(new ProcessStartInfo(exe,"--update-failed "+token.ToString("N")){UseShellExecute=false,WorkingDirectory=dir});
+                }
+            }
+        }
+    }
+    internal static void ReplaceAndLaunch(string dir,string payload,string helper,Guid token,EventWaitHandle loaded,Action<Changes> metadata) {
+        using(var tx=new Changes()) {
+            // The old frame worker may still be releasing the image after its parent exited.
+            var wait=Stopwatch.StartNew();
+            for(;;) {
+                try {tx.Replace(Exe(dir),payload);break;}
+                catch(IOException ex) {
+                    int code=ex.HResult&65535;
+                    if((code!=32 && code!=33) || wait.ElapsedMilliseconds>=5000) throw;
+                    Thread.Sleep(100);
+                }
+            }
+            tx.Replace(Path.Combine(dir,Maintenance),helper);metadata(tx);
+            using(var app=Process.Start(new ProcessStartInfo(Exe(dir),"--update-ready "+token.ToString("N")){UseShellExecute=false,WorkingDirectory=dir})) {
+                var watch=Stopwatch.StartNew();
+                while(!loaded.WaitOne(100) && !app.HasExited && watch.ElapsedMilliseconds<45000) {}
+                if(app.HasExited || !loaded.WaitOne(0)) {
+                    if(!app.HasExited) {app.Kill();app.WaitForExit();}
+                    throw new IOException("Updated application did not start");
+                }
+            }
+            tx.Commit();
+        }
+    }
     static string Shortcut(string file,string target) {
         dynamic shell=Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell",true));
         try {
@@ -122,7 +181,7 @@ internal sealed class Distribution : F.Form {
             } finally { Marshal.FinalReleaseComObject(link); }
         } finally { Marshal.FinalReleaseComObject(shell); }
     }
-    sealed class Changes : IDisposable {
+    internal sealed class Changes : IDisposable {
         readonly Stack<Action> undo=new Stack<Action>();
         readonly List<string> backups=new List<string>();
         bool committed;
@@ -191,7 +250,7 @@ internal sealed class Distribution : F.Form {
             else if(Equal(run,Quote(exe)) || Equal(run,Quote(OldExe))) tx.Value(RunSub,"GameDock",null);
             tx.Value(InstallSub,"Path",target);
             tx.Value(Arp,"DisplayName","GameDock");
-            tx.Value(Arp,"DisplayVersion","1.11.2");
+            tx.Value(Arp,"DisplayVersion","1.12.0");
             tx.Value(Arp,"Publisher","bakR"); tx.Value(Arp,"InstallLocation",target);
             tx.Value(Arp,"DisplayIcon",Quote(exe)+",0");
             tx.Value(Arp,"NoModify",1); tx.Value(Arp,"NoRepair",1);
@@ -206,6 +265,16 @@ internal sealed class Distribution : F.Form {
         if(Running()) { F.MessageBox.Show(Locale("أغلق GameDock من إعداداته ثم أعد الإزالة.","Quit GameDock from its settings, then try again."),"GameDock"); return; }
         if(F.MessageBox.Show(Locale("تريد إزالة GameDock؟ ستبقى ألعابك وإعداداتك محفوظة.","Remove GameDock? Your games and preferences will be kept."),"GameDock",F.MessageBoxButtons.YesNo)!=F.DialogResult.Yes) return;
         string temp=Path.Combine(Path.GetTempPath(),"GameDock-Remove-"+Guid.NewGuid().ToString("N"));
+        using(var service=Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\GameDockFrameMeter")) {
+            if(service!=null && F.MessageBox.Show(Locale("هل تريد إزالة مكوّن FPS المشترك من هذا الجهاز أيضًا؟ اختر لا إذا كان يستخدمه حساب آخر.","Also remove the shared FPS component from this PC? Choose No if another account uses it."),
+                "GameDock FPS",F.MessageBoxButtons.YesNo)==F.DialogResult.Yes) {
+                try {
+                    using(var remove=Process.Start(new ProcessStartInfo(Self,"--remove-fps"){UseShellExecute=true,Verb="runas"})) {
+                        remove.WaitForExit();if(remove.ExitCode!=0) throw new IOException("FPS component removal did not complete.");
+                    }
+                } catch(System.ComponentModel.Win32Exception e) {if(e.NativeErrorCode!=1223) throw;return;}
+            }
+        }
         Directory.CreateDirectory(temp);
         string copy=Path.Combine(temp,Maintenance); File.Copy(Self,copy);
         Process.Start(new ProcessStartInfo(copy,"--finish-remove "+Process.GetCurrentProcess().Id){UseShellExecute=false,WorkingDirectory=temp});

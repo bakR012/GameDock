@@ -20,7 +20,7 @@ using Forms = System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCopyright("© 2026 bakR")]
 [assembly: System.Reflection.AssemblyTitle("GameDock")]
 [assembly: System.Reflection.AssemblyProduct("GameDock")]
-[assembly: System.Reflection.AssemblyFileVersion("1.11.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.12.0.0")]
 partial class GameDock : Window {
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
     static extern int GetWindowLong(IntPtr window, int index);
@@ -137,7 +137,7 @@ partial class GameDock : Window {
     bool closing;
     Forms.NotifyIcon tray;
     readonly StackPanel access = new StackPanel { Orientation = Orientation.Horizontal };
-    System.Drawing.Icon logo;
+    System.Drawing.Icon logo,updateLogo;
     Window settingsWindow;
     bool english, useTray;
     string T(string ar, string en) { return english ? en : ar; }
@@ -795,6 +795,7 @@ partial class GameDock : Window {
         if (tray == null) return;
         tray.Visible = false; tray.Dispose(); tray = null;
         logo.Dispose(); logo = null;
+        if(updateLogo!=null) {updateLogo.Dispose();updateLogo=null;}
     }
     void CreateTray() {
         tray = new Forms.NotifyIcon();
@@ -809,17 +810,38 @@ partial class GameDock : Window {
             if (e.Button == Forms.MouseButtons.Left || e.Button == Forms.MouseButtons.Right) OpenSettings();
         };
     }
+    System.Drawing.Icon UpdateTrayIcon() {
+        if(updateLogo!=null) return updateLogo;
+        using(var bitmap=logo.ToBitmap())
+        using(var graphics=System.Drawing.Graphics.FromImage(bitmap)) {
+            int size=Math.Max(5,bitmap.Width/3);
+            graphics.FillEllipse(System.Drawing.Brushes.Turquoise,bitmap.Width-size,0,size,size);
+            var handle=bitmap.GetHicon();
+            try {updateLogo=(System.Drawing.Icon)System.Drawing.Icon.FromHandle(handle).Clone();}
+            finally {DestroyIcon(handle);}
+        }
+        return updateLogo;
+    }
     void ApplyAccess() {
         access.Children.Clear();
         if (useTray && host == this) {
             if (tray == null) CreateTray();
             tray.Text = T("GameDock — الإعدادات", "GameDock — Settings");
+            if(host.NotifyUpdate) tray.Text=T("GameDock — تحديث متاح","GameDock — Update available");
+            tray.Icon=host.NotifyUpdate?UpdateTrayIcon():logo;
             tray.Visible = true;
         } else ReleaseTray();
         access.Visibility = useTray ? Visibility.Collapsed : Visibility.Visible;
         if (!useTray) {
             var button = Tile(Dots(), T("الإعدادات", "Settings"), OpenSettings);
             if (Side) button.Height = 33; else button.Width = 33;
+            if(host.NotifyUpdate) {
+                var content=new Grid();var dots=button.Content as UIElement;button.Content=null;
+                if(dots!=null) content.Children.Add(dots);
+                content.Children.Add(new Border {Width=6,Height=6,Background=Brushes.Turquoise,CornerRadius=new CornerRadius(3),
+                    HorizontalAlignment=HorizontalAlignment.Right,VerticalAlignment=VerticalAlignment.Top});
+                button.Content=content;
+            }
             access.Children.Add(button);
             access.Children.Add(new Border { Width = Side ? 24 : 1, Height = Side ? 1 : 24, Background = Color("#60DDDDDD"), Margin = Side ? new Thickness(0,2,0,6) : new Thickness(2,0,6,0) });
         }
@@ -974,12 +996,14 @@ partial class GameDock : Window {
         nav.Children.Add(new TextBlock {Text="GameDock",FontSize=17,FontWeight=FontWeights.Bold,Margin=new Thickness(4,1,4,14)});
         for(int i=0;i<pages.Length;i++) {
             int page=i;
-            string label=pages[i]+(i==4 && published!=null && published>ProjectInfo.Current ? " •" : "");
+            string label=pages[i]+(i==4 && NotifyUpdate ? " •" : "");
             var tab=SettingButton(label,delegate {settingsPage=page; minecraftDetails=false; DrawSettings();},page==settingsPage);
             nav.Children.Add(tab);
         }
         DockPanel.SetDock(nav,Dock.Left); layout.Children.Add(nav);
         var body=new StackPanel {Margin=new Thickness(6,0,6,6)};
+        if(settingsPage!=4 && NotifyUpdate) body.Children.Add(SettingButton(
+            T("تحديث متاح — ","Update available — ")+published,delegate {settingsPage=4;DrawSettings();},false));
         Heading(body,settingsPage==2 && minecraftDetails ? "Minecraft" : pages[settingsPage]);
         switch(settingsPage) {
             case 0: DrawDockSettings(body); DrawGeneralSettings(body); break;
@@ -1123,6 +1147,8 @@ partial class GameDock : Window {
             if (host != this) return;
             if(fpsEnabled) StartFps();
             StartupUpdateCheck();
+            updateClock=new System.Windows.Threading.DispatcherTimer {Interval=TimeSpan.FromHours(24)};
+            updateClock.Tick+=delegate {StartupUpdateCheck();};updateClock.Start();
             try { if (File.Exists(settings)) folder = File.ReadAllText(settings); } catch (IOException) {}
             if (automatic) { Refresh(); ArrangeDisplays(); ScanGames(); return; }
             if (!Directory.Exists(folder)) Choose();
@@ -1140,6 +1166,8 @@ partial class GameDock : Window {
             closing = true; ReleaseTray(); StopGameWatchers();
             if (host == this) {
                 StopFps();
+                if(updateClock!=null) updateClock.Stop();
+                if(updateDownload!=null) updateDownload.Cancel();
                 SystemEvents.DisplaySettingsChanged -= DisplayChanged;
                 System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged-=NetworkChanged;
                 foreach (var mirror in mirrors.ToArray()) mirror.Close();
@@ -1348,13 +1376,27 @@ partial class GameDock : Window {
     [DllImport("shell32.dll",CharSet=CharSet.Unicode)]
     static extern void SHChangeNotify(int eventId,uint flags,string path,IntPtr unused);
     [STAThread] static void Main(string[] args) {
+        if(args.Length==1 && args[0]=="--setup-fps") {Environment.ExitCode=FpsSetup.Configure(false);return;}
         if(args.Length>0 && args[0]=="--fps-session") {FpsSession.Worker(args);return;}
         if (args.Contains("--refresh-icon"))
             SHChangeNotify(0x2000,0x0005,System.Reflection.Assembly.GetExecutingAssembly().Location,IntPtr.Zero);
         bool first;
         using (var mutex = new System.Threading.Mutex(true, @"Local\GameDock.FolderDock.1", out first)) {
             if (!first) return;
-            new Application().Run(new GameDock());
+            var app=new Application();var dock=new GameDock();
+            Guid updateId;
+            if(args.Length==2 && args[0]=="--update-failed" && Guid.TryParseExact(args[1],"N",out updateId)) {
+                dock.updateStatus=dock.T("تعذّر تشغيل التحديث. استعدنا النسخة السابقة.","The update could not start. Your previous version was restored.");
+                ProjectInfo.ClearDownload(updateId);
+            }
+            if(args.Length==2 && args[0]=="--update-ready" && Guid.TryParseExact(args[1],"N",out updateId)) {
+                dock.ContentRendered+=delegate {
+                    try {using(var ready=System.Threading.EventWaitHandle.OpenExisting(@"Local\GameDock.Update."+updateId.ToString("N")+".loaded")) ready.Set();}
+                    catch(System.Threading.WaitHandleCannotBeOpenedException) {}
+                    ProjectInfo.ClearDownload(updateId);
+                };
+            }
+            app.Run(dock);
         }
     }
 }

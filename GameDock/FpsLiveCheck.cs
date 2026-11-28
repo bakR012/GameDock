@@ -46,6 +46,31 @@ internal static class FpsLiveCheck {
             Console.WriteLine("PASS FPS worker recovers a missed foreground and failed capture, stays active, idles and follows a renderer handoff");
         }
     }
+    internal static void BrokerChannel() {
+        using(var process=Process.GetCurrentProcess()) {
+            if(process.SessionId==0) return;
+            // Both test endpoints live in this process, including on a Windows
+            // app-container test desktop. The installed service is machine-wide.
+            string name=@"LOCAL\GameDock.ServiceTest."+Guid.NewGuid().ToString("N");
+            var meter=new FpsBroker(process.Id);
+            using(var stop=new CancellationTokenSource(6000))
+            using(var server=new System.IO.Pipes.NamedPipeServerStream(name,System.IO.Pipes.PipeDirection.InOut,1,System.IO.Pipes.PipeTransmissionMode.Byte,System.IO.Pipes.PipeOptions.Asynchronous))
+            using(var client=new System.IO.Pipes.NamedPipeClientStream(".",name,System.IO.Pipes.PipeAccessRights.ReadData|System.IO.Pipes.PipeAccessRights.WriteData,
+                System.IO.Pipes.PipeOptions.Asynchronous,System.Security.Principal.TokenImpersonationLevel.Identification,System.IO.HandleInheritability.None)) {
+                var worker=Task.Run(async delegate {
+                    await server.WaitForConnectionAsync();
+                    try {await FrameService.Measure(server,stop.Token,pid=>new TestCapture(72,false));}
+                    catch(Exception) {if(!stop.IsCancellationRequested) throw;}
+                    finally {server.Dispose();}
+                });
+                client.Connect(3000);
+                var reading=Task.Run(delegate {try {meter.ReadSamples(client,stop.Token);} catch(System.IO.IOException) {if(!stop.IsCancellationRequested) throw;} catch(OperationCanceledException) {if(!stop.IsCancellationRequested) throw;}});
+                if(!SpinWait.SpinUntil(()=>meter.Rate(Stopwatch.GetTimestamp())==72,4000)) throw new Exception("No service sample");
+                stop.Cancel();if(!Task.WaitAll(new[]{worker,reading},4000)) throw new Exception("Service connection did not stop");
+                Console.WriteLine("PASS local FPS service protocol validates the session, streams a numeric sample and stops");
+            }
+        }
+    }
     [StructLayout(LayoutKind.Sequential)]
     struct Mode {internal uint Width,Height,RefreshNumerator,RefreshDenominator,Format,Scanline,Scaling;}
     [StructLayout(LayoutKind.Sequential)]

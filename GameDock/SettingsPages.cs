@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Diagnostics;
+using System.Threading;
 using System.Linq;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -16,6 +18,53 @@ partial class GameDock {
     bool minecraftDetails,loadingLaunchers,checkingUpdate,failedUpdate,launcherError;
     bool checkAtStartup=Preference("CheckUpdatesAtStartup",1,0,1)==1;
     Version published=PreviousRelease();
+    CancellationTokenSource updateDownload;
+    System.Windows.Threading.DispatcherTimer updateClock;
+    string updateStatus;
+    int updatePercent;
+    bool installingUpdate;
+    bool NotifyUpdate {get{return checkAtStartup && published!=null && published>ProjectInfo.Current &&
+        !String.Equals(ReadSetting(prefs,"DeferredUpdate","") as string,published.ToString(),StringComparison.Ordinal);}}
+    async void UpdateAndRestart() {
+        if(installingUpdate || closing) return;
+        string installed=Registry.GetValue(@"HKEY_CURRENT_USER\Software\GameDock\Installation","Path","") as string;
+        if(String.IsNullOrEmpty(installed) || !Paths.Equals(Path.Combine(installed,"GameDock.exe"),typeof(GameDock).Assembly.Location)) {
+            updateStatus=T("لتحديث هذه النسخة تلقائيًا، ثبّت GameDock أولًا.","Install this copy of GameDock to enable one-click updates.");DrawSettings();return;
+        }
+        installingUpdate=true;updateDownload=new CancellationTokenSource();updateStatus=null;updatePercent=0;
+        var cancel=updateDownload.Token;string file=null;
+        try {
+            DrawSettings();
+            var release=await ProjectInfo.Check();
+            if(release.Version<=ProjectInfo.Current) {published=release.Version;return;}
+            if(release.Download==null) throw new InvalidDataException();
+            var progress=new Progress<int>(delegate(int percent) {
+                if(!installingUpdate || closing || updatePercent==percent) return;
+                updatePercent=percent;if(settingsWindow!=null && settingsPage==4) DrawSettings();
+            });
+            file=await Task.Run(()=>ProjectInfo.Download(release,((IProgress<int>)progress).Report,cancel));
+            if(closing || cancel.IsCancellationRequested) return;
+            string id=Path.GetFileName(Path.GetDirectoryName(file)).Substring("GameDock-Update-".Length);
+            using(var parent=Process.GetCurrentProcess())
+            using(var prepared=new EventWaitHandle(false,EventResetMode.ManualReset,@"Local\GameDock.Update."+id+".prepared"))
+            using(var helper=Process.Start(new ProcessStartInfo(file,"--update "+parent.Id+" "+parent.StartTime.ToUniversalTime().Ticks+" "+id){UseShellExecute=false,WorkingDirectory=Path.GetDirectoryName(file)})) {
+                bool ready=await Task.Run(delegate {
+                    var watch=Stopwatch.StartNew();
+                    while(!helper.HasExited && !cancel.IsCancellationRequested && watch.ElapsedMilliseconds<15000)
+                        if(prepared.WaitOne(100)) return true;
+                    return false;
+                });
+                if(!ready) throw new IOException();
+                if(!closing) Application.Current.Shutdown();
+            }
+        } catch(Exception) {
+            updateStatus=T("تعذّر إكمال التحديث. نسختك الحالية جاهزة للاستخدام. أعد المحاولة.","Update could not be completed. Your current version is ready to use. Try again.");
+        } finally {
+            installingUpdate=false;updateDownload.Dispose();updateDownload=null;
+            if(file!=null && !closing) try {File.Delete(file);Directory.Delete(Path.GetDirectoryName(file));} catch(IOException) {} catch(UnauthorizedAccessException) {}
+            if(!closing && settingsWindow!=null && settingsPage==4) DrawSettings();
+        }
+    }
     static Version PreviousRelease() {
         Version version;
         Version.TryParse(ReadSetting(prefs,"LatestStableVersion","") as string,out version);
@@ -151,7 +200,7 @@ partial class GameDock {
         checkingUpdate=true; failedUpdate=false;
         if(settingsWindow!=null && settingsPage==4) DrawSettings();
         try {
-            published=await ProjectInfo.Check();
+            published=(await ProjectInfo.Check()).Version;
             try {
                 Registry.SetValue(prefs,"LatestStableVersion",published.ToString());
                 Registry.SetValue(prefs,"LastUpdateCheckUtc",DateTime.UtcNow.Ticks,RegistryValueKind.QWord);
@@ -159,6 +208,8 @@ partial class GameDock {
         }
         catch(Exception) {failedUpdate=true;}
         finally {checkingUpdate=false;}
+        if(closing) return;
+        ApplyAccess();foreach(var mirror in mirrors) mirror.ApplyAccess();
         if(settingsWindow!=null && (settingsPage==4 || !manual && published!=null && published>ProjectInfo.Current)) DrawSettings();
     }
     void DrawAbout(StackPanel body) {
@@ -167,13 +218,18 @@ partial class GameDock {
         check.IsEnabled=!checkingUpdate; body.Children.Add(check);
         if(published!=null && published>ProjectInfo.Current) {
             Detail(body,T("يتوفر إصدار جديد · ","New version available · ")+published);
-            body.Children.Add(SettingButton(T("فتح صفحة التحديث","Open update page"),delegate {Launch(ProjectInfo.Repository+"/releases/tag/v"+published);},false));
+            var apply=SettingButton(installingUpdate?T("جارٍ التحديث ","Updating ")+updatePercent+"%":T("تحديث وإعادة تشغيل","Update and restart"),UpdateAndRestart,false);
+            apply.IsEnabled=!installingUpdate;body.Children.Add(apply);
+            if(NotifyUpdate && !installingUpdate) body.Children.Add(SettingButton(T("لاحقًا","Later"),delegate {
+                Registry.SetValue(prefs,"DeferredUpdate",published.ToString());ApplyAccess();foreach(var mirror in mirrors) mirror.ApplyAccess();DrawSettings();
+            },false));
         } else if(published!=null && !failedUpdate && !checkingUpdate) Detail(body,T("لديك أحدث إصدار.","You’re up to date."));
+        if(updateStatus!=null) Detail(body,updateStatus);
         if(failedUpdate) {
             Detail(body,T("تعذّر الاتصال بـ GitHub. أعد المحاولة أو افتح صفحة الإصدارات.","Could not reach GitHub. Try again or open the releases page."));
             body.Children.Add(SettingButton(T("صفحة الإصدارات","Releases"),delegate {Launch(ProjectInfo.Repository+"/releases");},false));
         }
-        AddSwitch(body,T("تحقّق عند بدء التشغيل","Check on startup"),checkAtStartup,delegate(bool on){checkAtStartup=on;SavePreference("CheckUpdatesAtStartup",on?1:0);});
+        AddSwitch(body,T("نبّهني عند توفر تحديث","Notify me about updates"),checkAtStartup,delegate(bool on){checkAtStartup=on;SavePreference("CheckUpdatesAtStartup",on?1:0);ApplyAccess();foreach(var mirror in mirrors) mirror.ApplyAccess();if(on) StartupUpdateCheck();DrawSettings();});
         Detail(body,T("شيفرة GameDock مفتوحة المصدر بموجب GPLv3.","GameDock source code is available under GPLv3."));
         var links=new WrapPanel();
         links.Children.Add(SettingButton("GitHub",delegate {Launch(ProjectInfo.Repository);},false));

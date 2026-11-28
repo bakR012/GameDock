@@ -74,13 +74,12 @@ internal sealed class FpsSession : IDisposable {
             return !user.IsInRole(WindowsBuiltInRole.Administrator) && !user.IsInRole(new SecurityIdentifier("S-1-5-32-559"));
         }
     }
-    internal Process StartWorker(bool elevate) {
+    internal Process StartWorker() {
         using(var parent=Process.GetCurrentProcess()) {
             var info=new ProcessStartInfo(typeof(FpsSession).Assembly.Location,
                 "--fps-session "+Id+" "+parent.Id+" "+parent.StartTime.ToUniversalTime().Ticks);
-            info.UseShellExecute=elevate;info.CreateNoWindow=true;info.WindowStyle=ProcessWindowStyle.Hidden;
+            info.UseShellExecute=false;info.CreateNoWindow=true;info.WindowStyle=ProcessWindowStyle.Hidden;
             info.WorkingDirectory=Environment.SystemDirectory;
-            if(elevate) info.Verb="runas";
             return Process.Start(info);
         }
     }
@@ -100,7 +99,8 @@ internal sealed class FpsSession : IDisposable {
         } catch(Exception) { /* Parent closed or Windows refused access. */ }
     }
     void Serve(WaitHandle exit) {
-        Serve(exit,()=>FpsWindows.RenderingPid(FpsWindows.GetForegroundWindow()),pid=>new NativeFrames(pid));
+        Serve(exit,()=>FpsWindows.RenderingPid(FpsWindows.GetForegroundWindow()),
+            pid=>FpsBroker.Installed()?(IFpsCapture)new FpsBroker(pid):new NativeFrames(pid));
     }
     internal void Serve(WaitHandle exit,Func<int> foreground,Func<int,IFpsCapture> create) {
         int current=-1,state=0,failures=0;long retryAt=0;

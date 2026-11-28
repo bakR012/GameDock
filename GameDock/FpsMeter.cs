@@ -179,7 +179,7 @@ partial class GameDock {
     static readonly TimeSpan FpsIdleInterval=TimeSpan.FromSeconds(2);
     FpsSession fpsSession;
     Process fpsProcess;
-    bool fpsStarting,fpsDeclined,fpsForceConsent;
+    bool fpsStarting,fpsDeclined,fpsForceConsent,fpsConfiguring;
     int fpsEpoch;
     void StartFps() {
         if(fpsTimer!=null) return;
@@ -197,12 +197,10 @@ partial class GameDock {
     async void PrepareFps(bool interactive) {
         if(!fpsEnabled || closing || fpsStarting || fpsSession!=null || fpsDeclined ||
             (!interactive && Stopwatch.GetTimestamp()<fpsRetryWorkerAt)) return;
-        bool elevate=fpsForceConsent || FpsSession.NeedsConsent();
-        if(elevate && !interactive) return;
         fpsStarting=true;int epoch=fpsEpoch;FpsSession channel=null;
         try {
             channel=new FpsSession(Guid.NewGuid().ToString("N"),true);
-            var worker=await Task.Run(()=>channel.StartWorker(elevate));
+            var worker=await Task.Run(()=>channel.StartWorker());
             if(worker==null) throw new IOException();
             if(!fpsEnabled || closing || epoch!=fpsEpoch) {channel.TargetGame(-1);worker.Dispose();return;}
             fpsSession=channel;channel=null;fpsProcess=worker;
@@ -300,13 +298,14 @@ partial class GameDock {
         int state=0;double rate=fpsSession==null?0:fpsSession.Reading(out state);
         if(state==-2) fpsForceConsent=true;
         if(state==-4) {CloseFpsSession();DelayWorkerRetry();}
-        if(state==-2) fpsFailure=T("أطفئ خيار FPS وفعّله ثم وافق على إذن ويندوز للقياس.","Switch FPS off and on, then allow Windows performance access.");
+        if(state==-2) fpsFailure=T("افتح إعداد العداد للسماح بالقياس على هذا الجهاز.","Use Set up FPS counter to enable measurement on this PC.");
         else if(state==-3) fpsFailure=null;
         else if(state==-1) fpsFailure=T("انقطع قياس الإطارات. يعيد GameDock المحاولة تلقائيًا.","Frame capture was interrupted. GameDock is retrying.");
-        else if(state==-4) fpsFailure=T("توقف قياس الإطارات. أعد فتح اللعبة من الدوك إذا احتاج ويندوز إذنًا جديدًا.","Frame capture stopped. Relaunch from the dock if Windows needs permission again.");
+        else if(state==-4) fpsFailure=T("انقطع اتصال العداد. يعيد GameDock الاتصال تلقائيًا.","The counter disconnected. GameDock will reconnect automatically.");
         else if(rate>0) {fpsFailure=null;fpsWorkerFailures=0;fpsRetryWorkerAt=0;}
         else if(state==1 && Stopwatch.GetTimestamp()-fpsOpened>6*Stopwatch.Frequency)
             fpsFailure=T("لم تصل إطارات من اللعبة بعد. يتابع العداد انتظار إطارات جديدة.","No frames received from the game yet. The counter is still listening.");
+        if(rate<=0) {if(fpsHud!=null && fpsHud.IsVisible) fpsHud.Hide();return;}
         if(fpsHud==null) fpsHud=new FpsHud();
         fpsHud.Display(fpsWindow,FpsWindows.GetForegroundWindow(),rate,fpsCorner==1);
     }
@@ -323,6 +322,20 @@ partial class GameDock {
         if(fpsHud!=null) {fpsHud.Close();fpsHud=null;}
         CloseFpsSession();
     }
+    async void ConfigureFps() {
+        if(fpsConfiguring) return;
+        fpsConfiguring=true;RefreshFpsSettings();
+        try {
+            bool ok=await Task.Run(delegate {
+                var info=new ProcessStartInfo(typeof(GameDock).Assembly.Location,"--setup-fps") {Verb="runas",UseShellExecute=true};
+                using(var p=Process.Start(info)) {p.WaitForExit();return p.ExitCode==0;}
+            });
+            if(!ok) throw new IOException();
+            fpsDeclined=false;fpsForceConsent=false;fpsFailure=null;
+            if(fpsSession!=null) fpsSession.TargetGame(fpsPid);
+        } catch(Exception) {fpsFailure=T("لم يكتمل إعداد العداد. يمكنك إعادة المحاولة هنا.","Setup was not completed. You can retry here.");}
+        finally {fpsConfiguring=false;if(!closing) RefreshFpsSettings();}
+    }
     void DrawFpsSettings(StackPanel body) {
         AddSwitch(body,T("إظهار FPS","Show FPS"),fpsEnabled,delegate(bool on) {
             fpsEnabled=on;SavePreference("FpsEnabled",on?1:0);fpsFailure=null;fpsDeclined=false;
@@ -330,7 +343,12 @@ partial class GameDock {
             DrawSettings();
         });
         if(!fpsEnabled) return;
-        Detail(body,fpsFailure ?? T("يظهر العداد فوق الألعاب في وضع النافذة أو ملء الشاشة بلا حدود. قد يخفيه وضع ملء الشاشة الحصري. إذا طلب ويندوز إذن القياس، وافق لهذه الجلسة.","Shows FPS in windowed and borderless fullscreen games. Exclusive fullscreen can hide the counter. If Windows asks, allow performance measurement for this session."));
+        if(fpsForceConsent || (FpsSession.NeedsConsent() && !FpsBroker.Installed())) {
+            Detail(body,T("جهّز القياس المحلي مرة واحدة لهذا الجهاز. يتطلب الإعداد موافقة مسؤول.","Set up local measurement once for this PC. Setup requires administrator approval."));
+            var setup=SettingButton(T("إعداد عداد الإطارات","Set up FPS counter"),ConfigureFps,false);
+            setup.IsEnabled=!fpsConfiguring;body.Children.Add(setup);
+        }
+        Detail(body,fpsFailure ?? T("يظهر العداد فوق الألعاب في وضع النافذة أو ملء الشاشة بلا حدود. قد يخفيه وضع ملء الشاشة الحصري.","Shows FPS in windowed and borderless fullscreen games. Exclusive fullscreen can hide the counter."));
         Section(body,T("مكان العدّاد","Counter position"),new[]{T("أعلى اليسار","Top left"),T("أعلى اليمين","Top right")},fpsCorner,
             delegate(int i){fpsCorner=i;SavePreference("FpsCorner",i);});
     }
